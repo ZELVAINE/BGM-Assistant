@@ -13,7 +13,7 @@ It’s designed to feel like a **co-GM sitting next to you**, not a generic chat
 - **Grounded, not theoretical.** Advice is based on Basketball GM mechanics, not real NBA assumptions.
 - **Direct when it matters.** The assistant aims to give clear recommendations instead of vague suggestions, especially in Co-GM and Auto modes.
 - **Minimal, not cluttered.** Clean chat-style UI with only the information that matters.
-- **State-aware.** Decisions are based on your current roster, situation, and recent context — not just generic advice.
+- **State-aware.** Decisions are based on your current roster, situation, and recent context, not just generic advice.
 
 ---
 
