@@ -1,0 +1,44 @@
+{
+  "manifest_version": 2,
+  "name": "BGM Assistant GM",
+  "version": "1.2.0",
+  "description": "AI-powered assistant GM for Basketball GM",
+  "icons": {
+    "48": "icons/icon48.png",
+    "96": "icons/icon96.png"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "tabs",
+    "*://play.basketball-gm.com/*",
+    "*://openrouter.ai/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://play.basketball-gm.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "panel.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_action": {
+    "default_title": "BGM Assistant GM",
+    "default_icon": "icons/icon48.png"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": false
+  },
+  "web_accessible_resources": [
+    "panel.html"
+  ]
+}
