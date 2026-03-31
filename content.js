@@ -1,5 +1,5 @@
 // BGM Assistant GM - content script
-// Runs on play.basketball-gm.com/l/* only (see manifest)
+// Runs on play.basketball-gm.com pages (see manifest)
 
 (function () {
   // don't double-inject if the SPA somehow re-runs this
@@ -85,12 +85,35 @@ Draft picks:
 TRADE LOGIC
 When evaluating trades, think about:
 - Asset value (OVR, POT, age, contract) on both sides
-- Cap implications - does the trade work salary-wise?
+- Cap implications - does the trade work salary-wise? Contract salary stays the same after a trade.
 - Timeline fit - does this player help now or later?
 - Roster count (max 18 players, must stay at or below)
 - What each team actually needs
+- Acceptance realism: would the other team actually say yes?
 
-If you can't confirm a trade is legal from the data provided, say "legality uncertain" rather than guessing.
+Rough legality rule for incoming salary:
+- Post-trade payroll for the other team is: current payroll - outgoing salary + incoming salary
+- Contract salary does NOT change in a trade. A $15M player still counts as $15M on the new team.
+- Example: if a team is $5M below the cap and sends out a $5M player, it can only take back about $10M before hitting the cap. Do not call a trade legal if that math fails.
+- When the user asks how to make an earlier trade work, re-check salary legality from scratch. Do not assume the earlier framework was legal.
+- Do not suggest a trade that obviously pushes the other team over its available room when the provided context says they do not have room for it
+- If legality is unclear from the data provided, say "legality uncertain" rather than guessing
+
+Trade realism rules:
+- Never assume a team will trade a player just because you want him
+- If a player is not explicitly listed under a team in the provided data, do not target him
+- Rebuilding teams usually want picks, prospects, rookie-scale value, or expiring money
+- Contending teams usually want win-now talent and should not dump good players for weak future assets
+- Neutral teams usually need fair value, not fantasy steals
+- In Scout/Advisor mode, prefer frameworks and price guidance over fake precision
+- In Co-GM/Auto mode, you MAY give exact trade packages, but only if they are both roughly legal and roughly plausible for the other side
+- If VALIDATED TRADE PACKAGES are provided below, you may ONLY use those exact packages as exact trade suggestions. Do not invent a different exact package. If none fit, discuss targets/frameworks only.
+- Every trade recommendation must include an acceptance label: Likely accepted, Possible, Unlikely, or Very unlikely
+- Every trade recommendation must also include a next-step label: Keep trying, Add a sweetener, or Walk away/look elsewhere
+- Use Keep trying only if the current offer is already close and minor persistence could work
+- Use Add a sweetener only if the deal is worth it and a realistic extra asset could push it over the line
+- Use Walk away/look elsewhere if the gap is too big, the fit is poor, or the price would stop making sense
+- If the best available exact package still looks unlikely, say that clearly and either sweeten the offer or say there is no realistic deal
 
 PLAN ALIGNMENT
 The user will set a plan (rebuild, contend, trade for picks, etc). Every recommendation should align to that plan. If you think the plan is wrong, say so once with brief reasoning, then suggest a better one using exactly this format on its own line:
@@ -107,6 +130,11 @@ RESPONSE STYLE
 - If you don't know something or the data is unclear, say so.
 - If there's no good move right now, say "there's no great move here" rather than forcing a recommendation.
 - In Auto mode: structure as Best action → Why → Risk → What to watch.
+- For any trade suggestion, include: exact package if appropriate for the mode, salary check, acceptance label, next-step label, and one-line reason the other team might agree or refuse.
+- Never do trade arithmetic in prose unless it matches the validated package numbers provided in context.
+- In Co-GM or Auto mode, if you give an exact trade package, end with one clear recommendation: keep trying as is, add a specific sweetener, or walk away/look elsewhere.
+- If the user asks whether an earlier trade is worth it or how to make it work, first re-state the revised legal framework, then say whether it is worth it, then say whether to keep trying, add a specific sweetener, or walk away. Never skip the salary check in follow-up trade answers.
+- For trade suggestions in Scout or Advisor mode, you can stay broader unless the user explicitly asks for an exact package.
 - When learning mode is ON: add a short "Why this works" section at the end explaining the basketball principle.`;
 
   // ── state ──────────────────────────────────────────────
@@ -212,8 +240,18 @@ RESPONSE STYLE
   tab.textContent = 'GM';
 
   const root = document.body || document.documentElement;
-  root.appendChild(panel);
-  root.appendChild(tab);
+  if (!root) {
+    window.addEventListener('DOMContentLoaded', () => {
+      const retryRoot = document.body || document.documentElement;
+      if (retryRoot && !document.getElementById('bgm-assistant-panel')) {
+        retryRoot.appendChild(panel);
+        retryRoot.appendChild(tab);
+      }
+    }, { once: true });
+  } else {
+    root.appendChild(panel);
+    root.appendChild(tab);
+  }
 
   // quick refs to elements we'll need repeatedly
   const chatArea      = panel.querySelector('#bgm-chat-area');
@@ -603,6 +641,181 @@ RESPONSE STYLE
     return +(p.ovr * 1.5 + upside + youth + perf - contractPenalty).toFixed(1);
   }
 
+  function teamTimeline(team, players) {
+    if (!players.length) return 'unknown';
+    const core = players.slice(0, 8);
+    const avgAge = core.reduce((s, p) => s + p.age, 0) / core.length;
+    const avgOvr = core.reduce((s, p) => s + p.ovr, 0) / core.length;
+    if (team.strategy === 'rebuilding' || (avgAge <= 24.5 && avgOvr < 58)) return 'young/retooling';
+    if (team.strategy === 'contending' || (avgAge >= 27 && avgOvr >= 60)) return 'win-now';
+    return 'middle';
+  }
+
+  function assetTier(val) {
+    if (val >= 120) return 'premium';
+    if (val >= 100) return 'strong';
+    if (val >= 80) return 'solid';
+    if (val >= 60) return 'light';
+    return 'throw-in';
+  }
+
+
+  function conservativeTeamCanAbsorb(currentPayroll, incoming, outgoing, salaryCap) {
+    const newPayroll = currentPayroll - outgoing + incoming;
+    if (currentPayroll <= salaryCap) {
+      return newPayroll <= salaryCap + 1; // allow tiny rounding drift
+    }
+    // conservative over-cap rule: don't let an over-cap team take back more than it sends out
+    return incoming <= outgoing + 1;
+  }
+
+  function conservativeTradeLegal({ salaryCap, myPayroll, otherPayroll, myOutgoing, otherOutgoing, myRosterCount, otherRosterCount, mySendCount, otherSendCount }) {
+    const myIncoming = otherOutgoing;
+    const otherIncoming = myOutgoing;
+    const newMyPayroll = myPayroll - myOutgoing + otherOutgoing;
+    const newOtherPayroll = otherPayroll - otherOutgoing + myOutgoing;
+    const newMyRoster = myRosterCount - mySendCount + otherSendCount;
+    const newOtherRoster = otherRosterCount - otherSendCount + mySendCount;
+    const myLegal = conservativeTeamCanAbsorb(myPayroll, myIncoming, myOutgoing, salaryCap);
+    const otherLegal = conservativeTeamCanAbsorb(otherPayroll, otherIncoming, otherOutgoing, salaryCap);
+    return {
+      legal: myLegal && otherLegal && newMyRoster <= 18 && newOtherRoster <= 18,
+      myLegal,
+      otherLegal,
+      newMyPayroll,
+      newOtherPayroll,
+      newMyRoster,
+      newOtherRoster
+    };
+  }
+
+  function acceptanceBucket(diff, timeline, receiveTv) {
+    // positive diff means we are overpaying; negative means our offer is too light
+    let adj = 0;
+    if (timeline === 'win-now' && receiveTv >= 95) adj -= 8;
+    if (timeline === 'young/retooling' && receiveTv >= 90) adj -= 5;
+    const score = diff + adj;
+    if (score >= 12) return 'Likely accepted';
+    if (score >= 2) return 'Possible';
+    if (score >= -8) return 'Unlikely';
+    return 'Very unlikely';
+  }
+
+  function nextStepLabel(label, diff) {
+    if (label === 'Likely accepted' || label === 'Possible') return 'Keep trying';
+    if (label === 'Unlikely' && diff >= -12) return 'Add a sweetener';
+    return 'Walk away/look elsewhere';
+  }
+
+  function buildValidatedTradePackages(gc, pageType) {
+    const teams = pickRelevantTeams(gc, pageType).slice(0, pageType === 'trade' || pageType === 'trade_proposals' ? 10 : 8);
+    const ourAssets = gc.myTradeAssets.filter(p => p.contract).slice(0, 10);
+    const salaryCap = gc.cap.salaryCap || 0;
+    const seen = new Set();
+    const out = [];
+
+    for (const team of teams) {
+      const targets = [];
+      const seenTargets = new Set();
+      for (const src of [...team.moveable, ...team.top]) {
+        if (!src || !src.contract || seenTargets.has(src.name)) continue;
+        seenTargets.add(src.name);
+        targets.push(src);
+        if (targets.length >= 5) break;
+      }
+
+      for (const target of targets) {
+        const targetSalary = target.contract?.amount || 0;
+        const targetTv = target.tv ?? 0;
+
+        // 1-for-1
+        for (const a of ourAssets) {
+          const legal = conservativeTradeLegal({
+            salaryCap,
+            myPayroll: gc.cap.payroll,
+            otherPayroll: team.payroll,
+            myOutgoing: a.contract.amount,
+            otherOutgoing: targetSalary,
+            myRosterCount: gc.roster.length,
+            otherRosterCount: team.rosterCount,
+            mySendCount: 1,
+            otherSendCount: 1,
+          });
+          if (!legal.legal) continue;
+          const sentTv = a.tv || 0;
+          const diff = +(sentTv - targetTv).toFixed(1);
+          const label = acceptanceBucket(diff, team.timeline, targetTv);
+          const step = nextStepLabel(label, diff);
+          const score = (targetTv * 1.2) - Math.abs(diff) + (label === 'Likely accepted' ? 10 : label === 'Possible' ? 6 : label === 'Unlikely' ? -2 : -10);
+          const key = `${team.abbrev}|${a.name}|${target.name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({
+            key,
+            team: team.name,
+            abbrev: team.abbrev,
+            receive: [target.name],
+            send: [a.name],
+            receiveSalary: targetSalary,
+            sendSalary: a.contract.amount,
+            theirPostPayroll: legal.newOtherPayroll,
+            ourPostPayroll: legal.newMyPayroll,
+            acceptance: label,
+            nextStep: step,
+            score,
+            reason: `${team.abbrev} ${team.timeline} team; value gap ${diff >= 0 ? '+' : ''}${diff.toFixed(1)} in our offer vs target.`
+          });
+        }
+
+        // 2-for-1 from our side for one target
+        for (let i = 0; i < ourAssets.length; i++) {
+          for (let j = i + 1; j < ourAssets.length; j++) {
+            const a = ourAssets[i], b = ourAssets[j];
+            const legal = conservativeTradeLegal({
+              salaryCap,
+              myPayroll: gc.cap.payroll,
+              otherPayroll: team.payroll,
+              myOutgoing: (a.contract.amount || 0) + (b.contract.amount || 0),
+              otherOutgoing: targetSalary,
+              myRosterCount: gc.roster.length,
+              otherRosterCount: team.rosterCount,
+              mySendCount: 2,
+              otherSendCount: 1,
+            });
+            if (!legal.legal) continue;
+            const sentTv = (a.tv || 0) + (b.tv || 0);
+            const diff = +(sentTv - targetTv).toFixed(1);
+            const label = acceptanceBucket(diff, team.timeline, targetTv);
+            const step = nextStepLabel(label, diff);
+            const score = (targetTv * 1.2) - Math.abs(diff) + (label === 'Likely accepted' ? 8 : label === 'Possible' ? 5 : label === 'Unlikely' ? -3 : -12) - 2.5;
+            const key = `${team.abbrev}|${a.name}+${b.name}|${target.name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push({
+              key,
+              team: team.name,
+              abbrev: team.abbrev,
+              receive: [target.name],
+              send: [a.name, b.name],
+              receiveSalary: targetSalary,
+              sendSalary: (a.contract.amount || 0) + (b.contract.amount || 0),
+              theirPostPayroll: legal.newOtherPayroll,
+              ourPostPayroll: legal.newMyPayroll,
+              acceptance: label,
+              nextStep: step,
+              score,
+              reason: `${team.abbrev} ${team.timeline} team; package is ${diff >= 0 ? 'richer' : 'lighter'} than target by ${Math.abs(diff).toFixed(1)} trade-value points.`
+            });
+          }
+        }
+      }
+    }
+
+    return out
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 14);
+  }
+
   // ── context builder ────────────────────────────────────
 
   async function buildGameContext(id) {
@@ -655,28 +868,42 @@ RESPONSE STYLE
       }))
       .sort((a, b) => a.season - b.season || a.round - b.round);
 
+    const myTradeAssets = roster
+      .filter(p => p.contract)
+      .map(p => ({
+        name: p.name, pos: p.pos, age: p.age, ovr: p.ovr, pot: p.pot,
+        contract: p.contract,
+        tv: tradeValue(p),
+        tier: assetTier(tradeValue(p))
+      }))
+      .sort((a, b) => b.tv - a.tv);
+
     // build a snapshot of every other team (used for trade context)
     const otherTeams = activeTeams
       .filter(t => t.tid !== userTid)
       .map(team => {
         const tp = byTeam.get(team.tid) || [];
         const tpay = tp.reduce((s, p) => s + (p.contract?.amount || 0), 0);
+        const room = (ga.salaryCap || 0) - tpay;
+        const timeline = teamTimeline(team, tp);
         return {
           tid:         team.tid,
           abbrev:      team.abbrev,
           name:        team.region + ' ' + team.name,
           strategy:    team.strategy || 'unknown',
+          timeline,
           payroll:     tpay,
+          capRoom:     room,
           rosterCount: tp.length,
           // top players and their trade value
-          top:    tp.slice(0, 5).map(p => ({ name: p.name, pos: p.pos, age: p.age, ovr: p.ovr, pot: p.pot, contract: p.contract })),
+          top:    tp.slice(0, 5).map(p => ({ name: p.name, pos: p.pos, age: p.age, ovr: p.ovr, pot: p.pot, contract: p.contract, tv: tradeValue(p), tier: assetTier(tradeValue(p)) })),
           // players most likely to be moveable (low trade value = cheaper, possibly available)
           moveable: tp
             .filter(p => p.contract && p.ovr >= 45)
-            .map(p => ({ ...p, tv: tradeValue(p) }))
+            .map(p => ({ ...p, tv: tradeValue(p), tier: assetTier(tradeValue(p)) }))
             .sort((a, b) => a.tv - b.tv)
-            .slice(0, 4)
-            .map(p => ({ name: p.name, ovr: p.ovr, pot: p.pot, contract: p.contract }))
+            .slice(0, 5)
+            .map(p => ({ name: p.name, ovr: p.ovr, pot: p.pot, age: p.age, contract: p.contract, tv: p.tv, tier: p.tier }))
         };
       })
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -693,7 +920,7 @@ RESPONSE STYLE
         type:      ga.salaryCapType,
         payroll
       },
-      roster, freeAgents, myPicks, otherTeams
+      roster, freeAgents, myPicks, otherTeams, myTradeAssets
     };
   }
 
@@ -831,6 +1058,10 @@ RESPONSE STYLE
 
     // page-specific reminders
     const pageType = gameContext.pageType;
+    const tradeFollowUp = /how (do|would) (i|we) make .*work|make .* work|is .* worth it|worth it|sweeten|revise the trade|adjust the trade|change the trade|counteroffer|counter-offer/i.test(userText);
+    if (tradeFollowUp) {
+      p += 'FOLLOW-UP TRADE CHECK: The user is asking about revising or judging a trade. Re-check salary legality from scratch using the provided payroll and cap-room data before suggesting any revised package. If the deal still fails the salary math, say so clearly and change the framework.\n\n';
+    }
     if (pageType === 'draft') {
       p += 'PAGE NOTE: Draft page. Only recommend players still visible/available on screen.\n\n';
     } else if (pageType === 'free_agents') {
@@ -882,6 +1113,18 @@ RESPONSE STYLE
     }
     p += '\n';
 
+    // code-validated exact trade packages
+    const validatedTrades = buildValidatedTradePackages(gc, pageType);
+    if (validatedTrades.length) {
+      p += 'VALIDATED TRADE PACKAGES (salary-checked conservatively in code; only use these for exact trade ideas):\n';
+      for (const tr of validatedTrades) {
+        p += `- ${tr.abbrev}: Send ${tr.send.join(' + ')} ($${Math.round(tr.sendSalary/1000)}M) | Receive ${tr.receive.join(' + ')} ($${Math.round(tr.receiveSalary/1000)}M) | Their post-trade payroll $${Math.round(tr.theirPostPayroll/1000)}M | Our post-trade payroll $${Math.round(tr.ourPostPayroll/1000)}M | Acceptance ${tr.acceptance} | Next step ${tr.nextStep} | ${tr.reason}\n`;
+      }
+      p += '\n';
+    } else {
+      p += 'VALIDATED TRADE PACKAGES: none found from the conservative salary checks. If discussing trades, stay at the framework/target level rather than inventing an exact package.\n\n';
+    }
+
     // current page content (tables, alerts etc)
     const pg = gameContext.page;
     if (pg?.heading || pg?.alerts || pg?.tables) {
@@ -901,7 +1144,8 @@ RESPONSE STYLE
     for (const t of relevantTeams) {
       const topStr = t.top.slice(0, 3).map(x => `${x.name} (${x.ovr}/${x.pot}, ${x.age})`).join(', ');
       const movStr = t.moveable.slice(0, 2).map(x => `${x.name} ($${Math.round((x.contract?.amount||0)/1000)}M)`).join(', ');
-      p += `${t.abbrev} | ${t.strategy} | payroll $${Math.round(t.payroll/1000)}M | roster ${t.rosterCount}/18 | top: ${topStr || 'none'} | possibly moveable: ${movStr || 'none'}\n`;
+      const roomLabel = t.capRoom >= 0 ? `cap room $${Math.round(t.capRoom/1000)}M` : `over cap by $${Math.round(Math.abs(t.capRoom)/1000)}M`;
+      p += `${t.abbrev} | ${t.strategy} | ${roomLabel} | payroll $${Math.round(t.payroll/1000)}M | roster ${t.rosterCount}/18 | top: ${topStr || 'none'} | possibly moveable: ${movStr || 'none'}\n`;
     }
 
     p += `\nUser's question: ${userText}\n`;
