@@ -1,113 +1,131 @@
+// BGM Assistant GM - content script
+// Runs on play.basketball-gm.com/l/* only (see manifest)
+
 (function () {
-  function initAssistant() {
-    if (document.getElementById('bgm-assistant-panel')) return;
+  // don't double-inject if the SPA somehow re-runs this
+  if (document.getElementById('bgm-assistant-panel')) return;
 
-  const STORAGE_PREFIX = 'bgmAssistant';
-  const CHAT_LIMIT = 30;
-  const PLAN_MARKER = 'PLAN_UPDATE_CANDIDATE:';
-  const DEFAULT_MODEL = 'deepseek/deepseek-chat-v3-0324';
-  const RESPONSE_CACHE_LIMIT = 18;
-  const REQUEST_COOLDOWN_MS = 4500;
-  const CACHE_TTL_MS = 1000 * 60 * 8;
-  const ACTION_LEDGER_LIMIT = 20;
+  // ── constants ──────────────────────────────────────────
 
+  const MODEL = 'deepseek/deepseek-chat-v3-0324';
+  const CHAT_KEEP = 30;          // max messages to keep in history
+  const CACHE_TTL = 8 * 60000;   // cached replies expire after 8 mins
+  const CACHE_MAX = 18;
+  const COOLDOWN = 4500;         // ms between API calls
+
+  // the four involvement modes
   const MODES = [
     {
       label: 'Scout',
-      prompt: 'Speak only when the user asks. Be brief. Evaluate, do not coach. Do not proactively suggest trades unless directly asked.'
+      prompt: 'Only speak when asked. Keep answers short. Evaluate, don\'t coach. No unsolicited trade ideas.'
     },
     {
       label: 'Advisor',
-      prompt: 'Give balanced advice with moderate detail. Offer occasional useful observations, but do not overwhelm the user.'
+      prompt: 'Give clear, balanced advice with enough detail to actually act on. Flag obvious issues, but don\'t overwhelm.'
     },
     {
       label: 'Co-GM',
-      prompt: 'Be proactive and directive. Flag issues early, state what you would do, and explain why in concrete terms.'
+      prompt: 'Be proactive. Tell the user what you\'d do and why, flag problems before they hurt, think a few moves ahead.'
     },
     {
       label: 'Auto',
-      prompt: 'Act like a daily operating guide. Tell the user the best action to take right now, why, backup options, and when to do nothing.'
+      prompt: 'Give the single best action to take right now with clear reasoning, a backup option, and what to watch next. Skip the hedging.'
     }
   ];
 
-  const SYSTEM = `You are Assistant GM, a Basketball GM sidebar assistant.
+  // system prompt - this is the most important thing to get right
+  // key design decisions:
+  //  - extremely clear about what the game lets you actually control
+  //  - uses in-game data only, ignores real-world rep
+  //  - explains its reasoning so the user can learn
+  //  - stays grounded (no invented mechanics)
+  const SYSTEM_PROMPT = `You are the assistant GM in a Basketball GM simulation. Your job is to help the user make good decisions based on what's actually in the game.
 
-IDENTITY AND TONE
-- Friendly, serious, grounded, and blunt when needed.
-- Sound like a smart basketball staff member, not a generic AI bot.
-- Never roleplay taking actions yourself. You only advise the user.
-- Never say that you are clicking buttons, sending offers, making signings, or changing lineups yourself.
+WHO YOU ARE
+You're like a smart front office analyst sitting next to the user. Friendly, direct, and honest. You explain your thinking so the user understands *why*, not just *what*. You admit uncertainty rather than making stuff up.
 
-DEEPSEEK RESPONSE DISCIPLINE
-- Be concise first, detailed second.
-- Do not ramble. Do not restate the full prompt.
-- Prefer short sections with clear labels over long essays.
-- If data is weak or legality is uncertain, say that plainly instead of guessing.
+WHAT YOU CAN AND CAN'T DO
+The game gives the user these controls:
+- Sign, trade, waive, or extend players
+- Set the lineup order (which affects who plays more)
+- Adjust PT (playing time) modifiers per player using the in-game slider
+- Draft players
+- Set the team's strategy (rebuilding / contending)
+- Manage the trade block
 
-GAME RULES
-- This assistant is for Basketball GM, not the real NBA.
-- Maximum roster size is 18 players, not 15.
-- Use Basketball GM rules and constraints whenever they differ from real NBA assumptions.
-- There is no direct manual control over individual player development.
-- You cannot set exact minutes for a specific player, script exact substitutions, control exact on/off timing, or micromanage exact starting positions beyond the game's actual lineup tools.
+What the game does NOT let you control:
+- You CANNOT set exact minutes for a specific player. Use PT modifiers and lineup order as proxies.
+- You CANNOT script substitution timing or rotations
+- You CANNOT manually develop a player or choose what ratings improve
+- You CANNOT control opponents or their decisions
+- Player development happens automatically based on age and pot
 
-CORE LIMITS
-- Use ONLY in-game information present in the prompt. Ignore real-world reputation if it conflicts with in-game data.
-- Judge players mainly by in-game ratings, age, contract, recent stats, team direction, payroll, roster count, and fit.
-- If a trade or signing cannot be verified as legal from the provided data, say so plainly.
-- Never recommend signing a player who is already on the current roster.
-- Do not tell the user to give exact minute totals, exact substitution patterns, or exact position assignments the game does not support. Recommend role, depth, lineup direction, or broad minute priority instead.
-- Do not invent cap exceptions, roster rules, or hidden mechanics you cannot verify.
-- If there is no good move, say so clearly.
+So if you want to say "give this player more minutes", say "move him up the depth chart and bump his PT modifier" instead. Never say "play him 28 minutes a game" - the user can't set that directly.
 
-MODE RULES
-- Scout: answer only the exact question, briefly, unless learning mode is enabled.
-- Advisor: balanced detail, occasional observations.
-- Co-GM: proactive, directive, flags issues before they become problems.
-- Auto: give the best next action right now, not vague possibilities.
+READING THE DATA
+All monetary values in the game are in thousands. $20,000 = $20M. Always convert when talking to the user.
 
-PLAN BOX RULES
-- The user plan is the team's active goal.
-- Every recommendation must be aligned to that plan first.
-- If you believe the plan is poor, say so once, briefly explain why, and propose a replacement plan.
-- When proposing a replacement plan, append a final line in EXACTLY this format:
-PLAN_UPDATE_CANDIDATE: <replacement plan text>
-- Only include that marker when you are actively proposing a new plan.
-- After proposing an alternative once, do not nag. If the user rejects it, follow the active plan.
+OVR rating scale (0-100):
+- 80+: superstar, franchise cornerstone
+- 70-79: all-star level, clear starter
+- 60-69: solid starter, reliable contributor
+- 50-59: average starter or good bench piece
+- 40-49: bench player, rotation-depth
+- Below 40: fringe roster / two-way type
 
-DECISION RULES
-- Prefer concrete, game-legal, explainable advice.
-- For trades, consider player value, age, OVR/POT, contract, team strategy, payroll pressure, roster count, and fit together.
-- Do not suggest impossible trades if salary, roster count, or team direction obviously make them bad.
-- If legality is uncertain, label it as legality uncertain.
-- If you suggest a trade, include one realistic framework only, not five weak ideas.
-- If there is no worthwhile trade, say do not trade right now.
+POT is the ceiling. A 22-year-old with OVR 55 and POT 75 is potentially very valuable. A 30-year-old with OVR 65 and POT 66 is what he is.
 
-OUTPUT RULES
-- Never use markdown tables.
-- Bold only the most important labels.
-- In Auto mode, usually use this structure:
-  **Best action**
-  **Why**
-  **Risk / legality**
-  **Backup**
-  **Next 2-3 steps**
-- In Scout mode, keep it tight.
-- If LEARNING MODE is ON, add a final section called **What to learn** with 2-4 short bullets explaining the basketball logic behind the recommendation.`;
+The salary cap is soft - teams can go over it using Bird Rights and other exceptions, but they pay luxury tax above the luxury line.
+
+Draft picks:
+- Round 1 picks are real assets, especially from rebuilding teams that might lottery
+- Round 2 picks are depth/development pieces, not usually headline trade assets
+- Unprotected picks from bad teams are worth more than your own picks if you're good
+
+TRADE LOGIC
+When evaluating trades, think about:
+- Asset value (OVR, POT, age, contract) on both sides
+- Cap implications - does the trade work salary-wise?
+- Timeline fit - does this player help now or later?
+- Roster count (max 18 players, must stay at or below)
+- What each team actually needs
+
+If you can't confirm a trade is legal from the data provided, say "legality uncertain" rather than guessing.
+
+PLAN ALIGNMENT
+The user will set a plan (rebuild, contend, trade for picks, etc). Every recommendation should align to that plan. If you think the plan is wrong, say so once with brief reasoning, then suggest a better one using exactly this format on its own line:
+PLAN_UPDATE_CANDIDATE: <your suggested plan>
+
+Only use that marker when genuinely suggesting a new plan. Don't nag if the user rejects it.
+
+RESPONSE STYLE
+- Be direct. Get to the point.
+- Explain your reasoning, especially for trades or big moves.
+- Use short paragraphs, not walls of text. Bold key terms.
+- No markdown tables.
+- Don't repeat the context back at the user.
+- If you don't know something or the data is unclear, say so.
+- If there's no good move right now, say "there's no great move here" rather than forcing a recommendation.
+- In Auto mode: structure as Best action → Why → Risk → What to watch.
+- When learning mode is ON: add a short "Why this works" section at the end explaining the basketball principle.`;
+
+  // ── state ──────────────────────────────────────────────
 
   let chatHistory = [];
-  let gameContext = null;
+  let gameContext = null;   // { gc, pageType, page } - refreshed before each call
   let apiKey = '';
-  let involvementLevel = 1;
-  let userGoal = '';
+  let mode = 1;             // index into MODES
+  let plan = '';            // user's stated team goal
   let panelOpen = false;
-  let pendingPlanCandidate = '';
-  let rejectedPlanCandidates = [];
   let learningMode = false;
   let responseCache = {};
-  let lastRequestAt = 0;
-  let actionLedger = [];
-  let previousSnapshot = null;
+  let lastCallAt = 0;
+  let actionLog = [];       // recent game state changes we've noticed
+  let lastSnapshot = null;  // for diffing roster changes
+  let pendingPlan = '';     // plan candidate waiting for user accept/reject
+  let rejectedPlans = [];   // plans the user has said no to
+
+  // ── panel HTML ─────────────────────────────────────────
 
   const panel = document.createElement('div');
   panel.id = 'bgm-assistant-panel';
@@ -116,62 +134,74 @@ OUTPUT RULES
     <div id="bgm-panel-header">
       <div id="bgm-header-top">
         <div id="bgm-logo-area">
-          <div id="bgm-logo-icon">GM</div>
-          <div id="bgm-title-stack">
-            <div id="bgm-title">Assistant GM</div>
-            <div id="bgm-subtitle">No league loaded</div>
-          </div>
+          <div id="bgm-title">Assistant GM</div>
+          <div id="bgm-subtitle">No league loaded</div>
         </div>
         <div id="bgm-header-actions">
-          <button class="bgm-icon-btn" id="bgm-settings-toggle" title="API Settings">⚙</button>
+          <button class="bgm-icon-btn" id="bgm-settings-toggle" title="API key settings">⚙</button>
           <button class="bgm-icon-btn" id="bgm-clear-btn" title="Clear chat">↺</button>
           <button class="bgm-icon-btn" id="bgm-close-btn" title="Close">✕</button>
         </div>
       </div>
       <div id="bgm-info-strip">
-        <div class="bgm-strip-pill"><span class="bgm-strip-label">Team</span><span class="bgm-strip-value" id="bgm-ctx-team">—</span></div>
-        <div class="bgm-strip-pill"><span class="bgm-strip-label">Season</span><span class="bgm-strip-value accent" id="bgm-ctx-season">—</span></div>
-        <div class="bgm-strip-pill"><span class="bgm-strip-label">Payroll</span><span class="bgm-strip-value" id="bgm-ctx-cap">—</span></div>
-        <div class="bgm-strip-pill"><span class="bgm-strip-label">Page</span><span class="bgm-strip-value" id="bgm-ctx-page">—</span></div>
+        <div class="bgm-strip-cell">
+          <span class="bgm-strip-label">Team</span>
+          <span class="bgm-strip-value" id="bgm-ctx-team">—</span>
+        </div>
+        <div class="bgm-strip-cell">
+          <span class="bgm-strip-label">Season</span>
+          <span class="bgm-strip-value accent" id="bgm-ctx-season">—</span>
+        </div>
+        <div class="bgm-strip-cell">
+          <span class="bgm-strip-label">Payroll</span>
+          <span class="bgm-strip-value" id="bgm-ctx-cap">—</span>
+        </div>
+        <div class="bgm-strip-cell">
+          <span class="bgm-strip-label">Page</span>
+          <span class="bgm-strip-value" id="bgm-ctx-page">—</span>
+        </div>
       </div>
       <div id="bgm-controls-row">
         <div id="bgm-mode-row">
-          ${MODES.map((m,i)=>`<button class="bgm-mode-btn${i===1?' active':''}" data-mode="${i}" title="${m.prompt}">${m.label}</button>`).join('')}
+          ${MODES.map((m, i) => `<button class="bgm-mode-btn${i === 1 ? ' active' : ''}" data-mode="${i}" title="${m.prompt}">${m.label}</button>`).join('')}
         </div>
         <div id="bgm-goal-row">
           <span id="bgm-goal-label">Plan</span>
-          <input type="text" id="bgm-goal-input" placeholder="e.g. rebuild through picks and cap space">
+          <input type="text" id="bgm-goal-input" placeholder="e.g. rebuild through picks, contend this year…">
         </div>
         <div id="bgm-aux-row">
-          <label class="bgm-switch" title="Explain the reasoning and what to learn from each move">
+          <label class="bgm-switch" title="Adds explanations of basketball reasoning to responses">
             <input type="checkbox" id="bgm-learning-toggle">
             <span class="bgm-switch-ui"></span>
-            <span class="bgm-switch-label">Learning</span>
+            <span class="bgm-switch-label">Explain reasoning</span>
           </label>
-          <div id="bgm-cache-status">Fresh</div>
+          <span id="bgm-cache-status">Ready</span>
         </div>
       </div>
       <div id="bgm-settings-panel">
         <label class="bgm-setting-label">OpenRouter API Key</label>
         <input type="password" id="bgm-api-key-input" placeholder="sk-or-…">
-        <button id="bgm-save-settings">Save Key</button>
+        <button id="bgm-save-settings">Save</button>
         <div id="bgm-api-status"></div>
       </div>
     </div>
     <div id="bgm-chat-area">
-      <div class="bgm-message system"><div class="bgm-bubble">Load a league page, set a plan, and ask away. This version is tuned for OpenRouter + DeepSeek V3 0324, uses leaner prompts, and caches repeated questions.</div></div>
+      <div class="bgm-message system">
+        <div class="bgm-bubble">Load a league page, set a plan above, and ask anything. I'll read your roster, cap, picks, and the current page automatically.</div>
+      </div>
     </div>
     <div id="bgm-quick-actions">
-      <button class="bgm-quick-btn" data-prompt="Give me a brief roster diagnosis based on our plan.">Roster</button>
-      <button class="bgm-quick-btn" data-prompt="What is the best action for today based on our plan and current page?">Next</button>
-      <button class="bgm-quick-btn" data-prompt="What trade targets actually fit our plan, and how likely are they to be available?">Trades</button>
-      <button class="bgm-quick-btn" data-prompt="Break down our cap situation, bad money, and flexibility.">Cap</button>
-      <button class="bgm-quick-btn" data-prompt="Which free agents fit our plan right now, with exact contract suggestions?">FAs</button>
-      <button class="bgm-quick-btn" data-prompt="Tell me the biggest problems you see right now and what order I should fix them in.">Issues</button>
+      <button class="bgm-quick-btn" data-prompt="Give me a quick roster diagnosis based on our plan.">Roster</button>
+      <button class="bgm-quick-btn" data-prompt="What's the best move to make right now given our plan and current situation?">Next move</button>
+      <button class="bgm-quick-btn" data-prompt="Break down our cap situation — payroll, flexibility, any bad contracts.">Cap</button>
+      <button class="bgm-quick-btn" data-prompt="Which free agents make sense for us right now and why?">Free agents</button>
+      <button class="bgm-quick-btn" data-prompt="What trade targets actually fit our plan? Be specific about what we'd give up.">Trade targets</button>
+      <button class="bgm-quick-btn" data-prompt="Evaluate the trade on screen. Is it good for us? Walk me through it.">Eval trade</button>
+      <button class="bgm-quick-btn" data-prompt="What are the biggest problems with our team right now and what order should I fix them?">Issues</button>
     </div>
     <div id="bgm-input-area">
       <div id="bgm-input-row">
-        <textarea id="bgm-user-input" placeholder="Ask your assistant GM…" rows="1"></textarea>
+        <textarea id="bgm-user-input" placeholder="Ask anything…" rows="1"></textarea>
         <button id="bgm-send-btn">↑</button>
       </div>
       <div id="bgm-input-hint">Enter to send · Shift+Enter for new line</div>
@@ -181,155 +211,92 @@ OUTPUT RULES
   tab.id = 'bgm-toggle-tab';
   tab.textContent = 'GM';
 
-  (document.body || document.documentElement).appendChild(panel);
-  (document.body || document.documentElement).appendChild(tab);
+  const root = document.body || document.documentElement;
+  root.appendChild(panel);
+  root.appendChild(tab);
 
-  const chatArea = panel.querySelector('#bgm-chat-area');
-  const userInput = panel.querySelector('#bgm-user-input');
-  const sendBtn = panel.querySelector('#bgm-send-btn');
-  const goalInput = panel.querySelector('#bgm-goal-input');
+  // quick refs to elements we'll need repeatedly
+  const chatArea      = panel.querySelector('#bgm-chat-area');
+  const userInput     = panel.querySelector('#bgm-user-input');
+  const sendBtn       = panel.querySelector('#bgm-send-btn');
+  const goalInput     = panel.querySelector('#bgm-goal-input');
   const settingsPanel = panel.querySelector('#bgm-settings-panel');
-  const apiKeyInput = panel.querySelector('#bgm-api-key-input');
-  const apiStatus = panel.querySelector('#bgm-api-status');
-  const subtitle = panel.querySelector('#bgm-subtitle');
-  const ctxTeam = panel.querySelector('#bgm-ctx-team');
-  const ctxSeason = panel.querySelector('#bgm-ctx-season');
-  const ctxCap = panel.querySelector('#bgm-ctx-cap');
-  const ctxPage = panel.querySelector('#bgm-ctx-page');
-  const learningToggle = panel.querySelector('#bgm-learning-toggle');
-  const cacheStatus = panel.querySelector('#bgm-cache-status');
+  const apiKeyInput   = panel.querySelector('#bgm-api-key-input');
+  const apiStatus     = panel.querySelector('#bgm-api-status');
+  const subtitle      = panel.querySelector('#bgm-subtitle');
+  const ctxTeam       = panel.querySelector('#bgm-ctx-team');
+  const ctxSeason     = panel.querySelector('#bgm-ctx-season');
+  const ctxCap        = panel.querySelector('#bgm-ctx-cap');
+  const ctxPage       = panel.querySelector('#bgm-ctx-page');
+  const learningCheck = panel.querySelector('#bgm-learning-toggle');
+  const cacheLabel    = panel.querySelector('#bgm-cache-status');
 
-  function getLeagueId() {
+  // ── storage helpers ────────────────────────────────────
+  // keys are scoped per league so different saves don't bleed into each other
+
+  function leagueId() {
     const m = location.pathname.match(/\/l\/(\d+)/);
-    return m ? parseInt(m[1], 10) : null;
+    return m ? m[1] : 'global';
   }
 
-  function chatStorageKey(leagueId) {
-    return `${STORAGE_PREFIX}:chat:${leagueId || 'global'}`;
+  function key(suffix) {
+    return `bgm:${leagueId()}:${suffix}`;
   }
 
-  function planStorageKey(leagueId) {
-    return `${STORAGE_PREFIX}:plan:${leagueId || 'global'}`;
+  async function loadState() {
+    const id = leagueId();
+    const result = await browser.storage.local.get([
+      'apiKey', 'mode',
+      key('chat'), key('plan'), key('rejectedPlans'),
+      key('learning'), key('cache'), key('actionLog'), key('snapshot')
+    ]);
+
+    if (result.apiKey)  { apiKey = result.apiKey; apiKeyInput.value = result.apiKey; apiStatus.textContent = '✓ Key saved'; apiStatus.className = 'ok'; }
+    if (result.mode != null) { mode = result.mode; updateModeButtons(); }
+
+    plan = result[key('plan')] || '';
+    goalInput.value = plan;
+
+    chatHistory    = result[key('chat')]          || [];
+    rejectedPlans  = result[key('rejectedPlans')] || [];
+    learningMode   = !!result[key('learning')];
+    responseCache  = result[key('cache')]         || {};
+    actionLog      = result[key('actionLog')]      || [];
+    lastSnapshot   = result[key('snapshot')]       || null;
+    learningCheck.checked = learningMode;
+
+    renderHistory();
   }
 
-  function rejectedPlansKey(leagueId) {
-    return `${STORAGE_PREFIX}:rejectedPlans:${leagueId || 'global'}`;
-  }
+  function saveChat()   { return browser.storage.local.set({ [key('chat')]: chatHistory.slice(-CHAT_KEEP) }); }
+  function savePlan()   { return browser.storage.local.set({ [key('plan')]: plan }); }
+  function saveRejected() { return browser.storage.local.set({ [key('rejectedPlans')]: rejectedPlans.slice(-10) }); }
+  function saveLearning() { return browser.storage.local.set({ [key('learning')]: learningMode }); }
+  function saveLog()    { return browser.storage.local.set({ [key('actionLog')]: actionLog.slice(-20) }); }
+  function saveSnap()   { return browser.storage.local.set({ [key('snapshot')]: lastSnapshot }); }
 
-  function learningModeKey(leagueId) {
-    return `${STORAGE_PREFIX}:learning:${leagueId || 'global'}`;
-  }
-
-  function responseCacheKey(leagueId) {
-    return `${STORAGE_PREFIX}:cache:${leagueId || 'global'}`;
-  }
-
-  function actionsKey(leagueId) {
-    return `${STORAGE_PREFIX}:actions:${leagueId || 'global'}`;
-  }
-
-  function snapshotKey(leagueId) {
-    return `${STORAGE_PREFIX}:snapshot:${leagueId || 'global'}`;
-  }
-
-  async function loadPersistentState() {
-    const leagueId = getLeagueId();
-    const keys = [
-      'apiKey',
-      'involvementLevel',
-      chatStorageKey(leagueId),
-      planStorageKey(leagueId),
-      rejectedPlansKey(leagueId),
-      learningModeKey(leagueId),
-      responseCacheKey(leagueId),
-      actionsKey(leagueId),
-      snapshotKey(leagueId)
-    ];
-    const result = await browser.storage.local.get(keys);
-
-    if (result.apiKey) {
-      apiKey = result.apiKey;
-      apiKeyInput.value = result.apiKey;
-      apiStatus.textContent = '✓ Key saved';
-      apiStatus.className = 'ok';
-    }
-    if (result.involvementLevel != null) {
-      involvementLevel = result.involvementLevel;
-      updateModes();
-    }
-
-    const storedPlan = result[planStorageKey(leagueId)] || '';
-    userGoal = storedPlan;
-    goalInput.value = storedPlan;
-
-    chatHistory = Array.isArray(result[chatStorageKey(leagueId)]) ? result[chatStorageKey(leagueId)] : [];
-    rejectedPlanCandidates = Array.isArray(result[rejectedPlansKey(leagueId)]) ? result[rejectedPlansKey(leagueId)] : [];
-    learningMode = !!result[learningModeKey(leagueId)];
-    learningToggle.checked = learningMode;
-    responseCache = result[responseCacheKey(leagueId)] || {};
-    actionLedger = Array.isArray(result[actionsKey(leagueId)]) ? result[actionsKey(leagueId)] : [];
-    previousSnapshot = result[snapshotKey(leagueId)] || null;
-    updateCacheStatus('Fresh');
-
-    renderChatHistory();
-  }
-
-  function saveChatHistory() {
-    const leagueId = getLeagueId();
-    return browser.storage.local.set({ [chatStorageKey(leagueId)]: chatHistory.slice(-CHAT_LIMIT) });
-  }
-
-  function saveGoal() {
-    const leagueId = getLeagueId();
-    return browser.storage.local.set({ [planStorageKey(leagueId)]: userGoal });
-  }
-
-  function saveRejectedPlans() {
-    const leagueId = getLeagueId();
-    return browser.storage.local.set({ [rejectedPlansKey(leagueId)]: rejectedPlanCandidates.slice(-10) });
-  }
-
-  function saveLearningMode() {
-    const leagueId = getLeagueId();
-    return browser.storage.local.set({ [learningModeKey(leagueId)]: learningMode });
-  }
-
-  function saveResponseCache() {
-    const leagueId = getLeagueId();
+  function saveCache() {
+    // prune expired entries before saving
     const now = Date.now();
-    const entries = Object.entries(responseCache)
-      .filter(([, v]) => v && (now - (v.ts || 0)) <= CACHE_TTL_MS)
-      .sort((a, b) => (b[1]?.ts || 0) - (a[1]?.ts || 0))
-      .slice(0, RESPONSE_CACHE_LIMIT);
-    responseCache = Object.fromEntries(entries);
-    return browser.storage.local.set({ [responseCacheKey(leagueId)]: responseCache });
+    const pruned = Object.fromEntries(
+      Object.entries(responseCache)
+        .filter(([, v]) => now - v.ts < CACHE_TTL)
+        .sort((a, b) => b[1].ts - a[1].ts)
+        .slice(0, CACHE_MAX)
+    );
+    responseCache = pruned;
+    return browser.storage.local.set({ [key('cache')]: pruned });
   }
 
-  function saveActionLedger() {
-    const leagueId = getLeagueId();
-    actionLedger = actionLedger.slice(-ACTION_LEDGER_LIMIT);
-    return browser.storage.local.set({ [actionsKey(leagueId)]: actionLedger });
-  }
-
-  function saveSnapshot() {
-    const leagueId = getLeagueId();
-    return browser.storage.local.set({ [snapshotKey(leagueId)]: previousSnapshot });
-  }
-
-  function updateCacheStatus(text, tone) {
-    if (!cacheStatus) return;
-    cacheStatus.textContent = text;
-    cacheStatus.className = tone ? tone : '';
-  }
+  // ── panel open/close ───────────────────────────────────
 
   function togglePanel() {
     panelOpen = !panelOpen;
     panel.classList.toggle('open', panelOpen);
-    const w = panel.offsetWidth || 340;
-    tab.style.right = panelOpen ? w + 'px' : '0';
+    tab.style.right = panelOpen ? (panel.offsetWidth || 340) + 'px' : '0';
     if (panelOpen) {
       refreshContext();
-      setTimeout(() => userInput.focus(), 100);
+      setTimeout(() => userInput.focus(), 80);
     }
   }
 
@@ -339,57 +306,71 @@ OUTPUT RULES
     if (msg.type === 'TOGGLE_PANEL') togglePanel();
   });
 
-  function updateModes() {
-    panel.querySelectorAll('.bgm-mode-btn').forEach((b, i) => b.classList.toggle('active', i === involvementLevel));
+  // ── mode buttons ───────────────────────────────────────
+
+  function updateModeButtons() {
+    panel.querySelectorAll('.bgm-mode-btn').forEach((btn, i) => {
+      btn.classList.toggle('active', i === mode);
+    });
   }
 
   panel.querySelectorAll('.bgm-mode-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      involvementLevel = parseInt(btn.dataset.mode, 10);
-      updateModes();
-      browser.storage.local.set({ involvementLevel });
+      mode = parseInt(btn.dataset.mode, 10);
+      updateModeButtons();
+      browser.storage.local.set({ mode });
     });
   });
 
-  panel.querySelector('#bgm-settings-toggle').addEventListener('click', () => settingsPanel.classList.toggle('open'));
+  // ── settings ───────────────────────────────────────────
+
+  panel.querySelector('#bgm-settings-toggle').addEventListener('click', () => {
+    settingsPanel.classList.toggle('open');
+  });
 
   panel.querySelector('#bgm-save-settings').addEventListener('click', () => {
-    const key = apiKeyInput.value.trim();
-    if (!key) {
-      apiStatus.textContent = '✗ Enter an OpenRouter key';
-      apiStatus.className = 'err';
-      return;
-    }
-    apiKey = key;
-    browser.storage.local.set({ apiKey: key });
+    const k = apiKeyInput.value.trim();
+    if (!k) { apiStatus.textContent = '✗ Paste your OpenRouter key'; apiStatus.className = 'err'; return; }
+    apiKey = k;
+    browser.storage.local.set({ apiKey: k });
     apiStatus.textContent = '✓ Saved';
     apiStatus.className = 'ok';
     settingsPanel.classList.remove('open');
   });
 
+  // ── plan input ─────────────────────────────────────────
+
   goalInput.addEventListener('change', async () => {
-    userGoal = goalInput.value.trim();
-    await saveGoal();
+    plan = goalInput.value.trim();
+    await savePlan();
   });
 
-  learningToggle.addEventListener('change', async () => {
-    learningMode = !!learningToggle.checked;
-    await saveLearningMode();
+  // ── learning toggle ────────────────────────────────────
+
+  learningCheck.addEventListener('change', async () => {
+    learningMode = learningCheck.checked;
+    await saveLearning();
   });
+
+  // ── clear chat ─────────────────────────────────────────
 
   panel.querySelector('#bgm-clear-btn').addEventListener('click', async () => {
     chatHistory = [];
     chatArea.innerHTML = '';
-    appendMsg('system', 'Chat cleared for this league.');
-    await saveChatHistory();
+    addMsg('system', 'Chat cleared.');
+    await saveChat();
   });
+
+  // ── quick buttons ──────────────────────────────────────
 
   panel.querySelectorAll('.bgm-quick-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       userInput.value = btn.dataset.prompt;
-      sendMessage();
+      send();
     });
   });
+
+  // ── textarea auto-resize ───────────────────────────────
 
   userInput.addEventListener('input', () => {
     userInput.style.height = 'auto';
@@ -397,95 +378,110 @@ OUTPUT RULES
   });
 
   userInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
-  sendBtn.addEventListener('click', sendMessage);
 
-  const resizer = panel.querySelector('#bgm-panel-resizer');
-  let resizing = false;
-  resizer.addEventListener('mousedown', e => {
-    resizing = true;
-    e.preventDefault();
+  sendBtn.addEventListener('click', send);
+
+  // ── resize handle ──────────────────────────────────────
+
+  let dragging = false;
+  panel.querySelector('#bgm-panel-resizer').addEventListener('mousedown', e => {
+    dragging = true; e.preventDefault();
   });
   document.addEventListener('mousemove', e => {
-    if (!resizing) return;
+    if (!dragging) return;
     const w = window.innerWidth - e.clientX;
     if (w >= 260 && w <= 640) {
       panel.style.width = w + 'px';
       if (panelOpen) tab.style.right = w + 'px';
     }
   });
-  document.addEventListener('mouseup', () => {
-    resizing = false;
-  });
+  document.addEventListener('mouseup', () => { dragging = false; });
 
-  function escapeHtml(text) {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+  // ── chat rendering ─────────────────────────────────────
+
+  function escape(text) {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  function formatMessageHtml(text) {
-    const safe = escapeHtml(text)
+  // minimal formatting: **bold** and line breaks only
+  function format(text) {
+    return escape(text)
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/(^|\n)-\s+(.+?)(?=\n|$)/g, '$1• $2')
       .replace(/\n/g, '<br>');
-    return safe;
   }
 
-  function createMessageNode(role, text) {
+  function addMsg(role, text) {
     const wrap = document.createElement('div');
     wrap.className = 'bgm-message ' + role;
+
     if (role !== 'system') {
       const lbl = document.createElement('div');
       lbl.className = 'bgm-msg-label';
       lbl.textContent = role === 'user' ? 'You' : 'Assistant GM';
       wrap.appendChild(lbl);
     }
+
     const bub = document.createElement('div');
     bub.className = 'bgm-bubble';
-    bub.innerHTML = formatMessageHtml(text);
+    bub.innerHTML = format(text);
     wrap.appendChild(bub);
-    return { wrap, bubble: bub };
-  }
-
-  function appendMsg(role, text) {
-    const { wrap, bubble } = createMessageNode(role, text);
     chatArea.appendChild(wrap);
     chatArea.scrollTop = chatArea.scrollHeight;
-    return bubble;
+    return bub;
   }
 
-  function renderChatHistory() {
+  function renderHistory() {
     chatArea.innerHTML = '';
     if (!chatHistory.length) {
-      appendMsg('system', 'Load a league page, set a plan, and ask away. This version is tuned for OpenRouter + DeepSeek V3 0324, uses leaner prompts, and caches repeated questions.');
+      addMsg('system', 'Load a league page, set a plan above, and ask anything. I\'ll read your roster, cap, picks, and the current page automatically.');
       return;
     }
-    for (const msg of chatHistory) appendMsg(msg.role, msg.content);
+    for (const m of chatHistory) addMsg(m.role, m.content);
   }
 
-  function showTyping() {
+  // stream in the reply word by word so it feels less instant
+  async function streamReply(text) {
     const wrap = document.createElement('div');
     wrap.className = 'bgm-message assistant';
-    wrap.id = 'bgm-typing';
     const lbl = document.createElement('div');
     lbl.className = 'bgm-msg-label';
     lbl.textContent = 'Assistant GM';
     const bub = document.createElement('div');
     bub.className = 'bgm-bubble';
-    const ind = document.createElement('div');
-    ind.className = 'bgm-typing';
-    [0, 1, 2].forEach(() => {
+    wrap.appendChild(lbl);
+    wrap.appendChild(bub);
+    chatArea.appendChild(wrap);
+
+    let built = '';
+    const chunks = text.split(/(\s+)/);
+    for (let i = 0; i < chunks.length; i++) {
+      built += chunks[i];
+      bub.innerHTML = format(built);
+      chatArea.scrollTop = chatArea.scrollHeight;
+      if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 10));
+    }
+    return bub;
+  }
+
+  function showTyping() {
+    const wrap = document.createElement('div');
+    wrap.id = 'bgm-typing';
+    wrap.className = 'bgm-message assistant';
+    const lbl = document.createElement('div');
+    lbl.className = 'bgm-msg-label';
+    lbl.textContent = 'Assistant GM';
+    const bub = document.createElement('div');
+    bub.className = 'bgm-bubble';
+    const dots = document.createElement('div');
+    dots.className = 'bgm-typing';
+    for (let i = 0; i < 3; i++) {
       const d = document.createElement('div');
       d.className = 'bgm-dot';
-      ind.appendChild(d);
-    });
-    bub.appendChild(ind);
+      dots.appendChild(d);
+    }
+    bub.appendChild(dots);
     wrap.appendChild(lbl);
     wrap.appendChild(bub);
     chatArea.appendChild(wrap);
@@ -497,108 +493,42 @@ OUTPUT RULES
     if (el) el.remove();
   }
 
-  async function streamAssistantMessage(text) {
-    const { wrap, bubble } = createMessageNode('assistant', '');
-    bubble.innerHTML = '';
-    chatArea.appendChild(wrap);
-    let visible = '';
-    const parts = text.split(/(\s+)/);
-    for (let i = 0; i < parts.length; i++) {
-      visible += parts[i];
-      bubble.innerHTML = formatMessageHtml(visible);
-      chatArea.scrollTop = chatArea.scrollHeight;
-      if (i < parts.length - 1) await new Promise(r => setTimeout(r, 12));
-    }
-    return bubble;
-  }
+  // ── page reading ───────────────────────────────────────
 
   function getPageType() {
     const p = location.pathname;
     if (p.includes('/trade_proposals')) return 'trade_proposals';
-    if (p.includes('/trade')) return 'trade';
-    if (p.includes('/roster')) return 'roster';
-    if (p.includes('/finances')) return 'finances';
-    if (p.includes('/draft')) return 'draft';
-    if (p.includes('/free_agents')) return 'free_agents';
-    if (p.includes('/standings')) return 'standings';
-    if (p.includes('/schedule')) return 'schedule';
-    if (p.includes('/player/')) return 'player';
+    if (p.includes('/trade'))           return 'trade';
+    if (p.includes('/roster'))          return 'roster';
+    if (p.includes('/finances'))        return 'finances';
+    if (p.includes('/draft'))           return 'draft';
+    if (p.includes('/free_agents'))     return 'free_agents';
+    if (p.includes('/standings'))       return 'standings';
+    if (p.includes('/schedule'))        return 'schedule';
+    if (p.includes('/player/'))         return 'player';
     return 'other';
   }
 
-  function getPageContent() {
+  function readPage() {
     const tables = [...document.querySelectorAll('table')].map(t => {
-      const h = [...t.querySelectorAll('th')].map(x => x.innerText.trim()).join(' | ');
-      const r = [...t.querySelectorAll('tr')].slice(0, 35).map(row =>
-        [...row.querySelectorAll('td')].map(c => c.innerText.trim()).join(' | ')
-      ).filter(Boolean).join('\n');
-      return h ? h + '\n' + r : r;
+      const headers = [...t.querySelectorAll('th')].map(h => h.innerText.trim()).join(' | ');
+      const rows = [...t.querySelectorAll('tr')].slice(0, 35)
+        .map(r => [...r.querySelectorAll('td')].map(c => c.innerText.trim()).join(' | '))
+        .filter(Boolean).join('\n');
+      return headers ? headers + '\n' + rows : rows;
     }).filter(Boolean).join('\n\n');
-    const alerts = [...document.querySelectorAll('.alert,.bg-danger,.bg-warning,.bg-success')]
-      .map(a => a.innerText.trim())
-      .filter(Boolean)
-      .join('\n');
-    const heading = document.querySelector('h1,h2')?.innerText?.trim() || '';
+
+    const alerts = [...document.querySelectorAll('.alert, .bg-danger, .bg-warning, .bg-success')]
+      .map(a => a.innerText.trim()).filter(Boolean).join('\n');
+
+    const heading = document.querySelector('h1, h2')?.innerText?.trim() || '';
+
     return { tables, alerts, heading };
   }
 
-  function extractLikelyPlayerNames(text) {
-    if (!text) return [];
-    const names = new Set();
-    const regex = /\b([A-Z][a-zA-Z'\-.]+(?:\s+[A-Z][a-zA-Z'\-.]+){1,2})\b/g;
-    let m;
-    while ((m = regex.exec(text))) {
-      const name = m[1].trim();
-      if (name.length < 4) continue;
-      if (/^(Season|Payroll|Roster|Salary|Luxury|Round|Page|Team|Strategy|Current Page|Trade Targets)$/i.test(name)) continue;
-      names.add(name);
-    }
-    return [...names].slice(0, 60);
-  }
+  // ── IndexedDB helpers ──────────────────────────────────
 
-  function buildSnapshot(gc, pageType, page) {
-    return {
-      season: gc?.season || null,
-      pageType,
-      rosterIds: (gc?.roster || []).map(p => p.pid).sort((a, b) => a - b),
-      rosterNames: (gc?.roster || []).map(p => p.name),
-      freeAgentIds: (gc?.fas || []).slice(0, 40).map(p => p.pid).sort((a, b) => a - b),
-      visiblePlayers: extractLikelyPlayerNames(`${page?.heading || ''}\n${page?.tables || ''}\n${page?.alerts || ''}`),
-      payroll: gc?.cap?.payroll || 0
-    };
-  }
-
-  function addLedgerEntry(text) {
-    if (!text) return;
-    if (actionLedger[actionLedger.length - 1] === text) return;
-    actionLedger.push(text);
-  }
-
-  function diffSnapshots(prev, next) {
-    if (!prev || !next) return [];
-    const out = [];
-    const nextRosterNames = new Set(next.rosterNames || []);
-    for (const name of next.rosterNames || []) {
-      if (!(prev.rosterNames || []).includes(name)) out.push(`Roster change: added ${name}.`);
-    }
-    for (const name of prev.rosterNames || []) {
-      if (!nextRosterNames.has(name)) out.push(`Roster change: removed ${name}.`);
-    }
-    const prevVisible = new Set(prev.visiblePlayers || []);
-    const nextVisible = new Set(next.visiblePlayers || []);
-    for (const name of prevVisible) {
-      if (!nextVisible.has(name)) out.push(`Page state changed: ${name} is no longer visible/available on the current page.`);
-    }
-    for (const name of nextVisible) {
-      if (!prevVisible.has(name)) out.push(`Page state changed: ${name} is now visible/available on the current page.`);
-    }
-    if (Math.abs((next.payroll || 0) - (prev.payroll || 0)) >= 500) {
-      out.push(`Payroll changed to $${Math.round((next.payroll || 0) / 1000)}M.`);
-    }
-    return out.slice(-8);
-  }
-
-  async function openDB(id) {
+  function openDB(id) {
     return new Promise((res, rej) => {
       const req = indexedDB.open('league' + id);
       req.onsuccess = e => res(e.target.result);
@@ -606,387 +536,411 @@ OUTPUT RULES
     });
   }
 
-  async function dbGetAll(db, store) {
+  function getAll(db, store) {
     return new Promise(res => {
       try {
         const req = db.transaction([store], 'readonly').objectStore(store).getAll();
         req.onsuccess = e => res(e.target.result);
         req.onerror = () => res([]);
-      } catch {
-        res([]);
-      }
+      } catch { res([]); }
     });
   }
 
-  function latestRatings(player, season) {
+  // ── player summarisation ───────────────────────────────
+
+  // get the ratings row for the given season (or closest past season)
+  function pickRatings(player, season) {
     if (!player.ratings?.length) return null;
-    return [...player.ratings].sort((a, b) => b.season - a.season).find(r => r.season <= season) || player.ratings[player.ratings.length - 1];
+    return [...player.ratings]
+      .sort((a, b) => b.season - a.season)
+      .find(r => r.season <= season) || player.ratings[player.ratings.length - 1];
   }
 
-  function latestRegularSeasonStats(player, season) {
+  // get last regular season stats, trying current season first then previous
+  function pickStats(player, season) {
     if (!player.stats?.length) return null;
-    const exact = [...player.stats].filter(s => s.season === season && !s.playoffs).pop();
-    if (exact?.gp > 0) return exact;
-    const prev = [...player.stats].filter(s => s.season === season - 1 && !s.playoffs).pop();
+    const current = player.stats.filter(s => s.season === season && !s.playoffs).pop();
+    if (current?.gp > 0) return current;
+    const prev = player.stats.filter(s => s.season === season - 1 && !s.playoffs).pop();
     return prev?.gp > 0 ? prev : null;
   }
 
-  function summarise(player, season) {
-    const r = latestRatings(player, season);
+  function summarisePlayer(player, season) {
+    const r = pickRatings(player, season);
     if (!r) return null;
-    const stat = latestRegularSeasonStats(player, season);
+    const s = pickStats(player, season);
     return {
-      pid: player.pid,
-      tid: player.tid,
-      name: player.firstName + ' ' + player.lastName,
-      pos: r.pos || player.pos,
-      age: season - player.born.year,
-      ovr: r.ovr,
-      pot: r.pot,
-      skills: r.skills || [],
+      pid:      player.pid,
+      tid:      player.tid,
+      name:     player.firstName + ' ' + player.lastName,
+      pos:      r.pos || player.pos,
+      age:      season - player.born.year,
+      ovr:      r.ovr,
+      pot:      r.pot,
       contract: player.contract ? {
         amount: player.contract.amount,
-        exp: player.contract.exp,
-        yrs: Math.max(0, player.contract.exp - season + 1)
+        exp:    player.contract.exp,
+        yrs:    Math.max(0, player.contract.exp - season + 1)
       } : null,
-      injury: player.injury?.type && player.injury.type !== 'Healthy' ? player.injury.type : null,
-      stats: stat ? {
-        season: stat.season,
-        gp: stat.gp,
-        min: stat.min ? Number((stat.min / stat.gp).toFixed(1)) : null,
-        pts: stat.pts ? Number((stat.pts / stat.gp).toFixed(1)) : null,
-        reb: (stat.drb || stat.orb) ? Number((((stat.drb || 0) + (stat.orb || 0)) / stat.gp).toFixed(1)) : null,
-        ast: stat.ast ? Number((stat.ast / stat.gp).toFixed(1)) : null,
-        per: stat.per ? Number(stat.per.toFixed(1)) : null,
-        ws: stat.ws ? Number(stat.ws.toFixed(1)) : null,
-        ewa: stat.ewa ? Number(stat.ewa.toFixed(1)) : null
+      injury: player.injury?.type !== 'Healthy' ? player.injury.type : null,
+      stats: s ? {
+        season: s.season,
+        gp:  s.gp,
+        pts: s.gp ? +(s.pts / s.gp).toFixed(1) : null,
+        reb: s.gp ? +((s.drb + s.orb) / s.gp).toFixed(1) : null,
+        ast: s.gp ? +(s.ast / s.gp).toFixed(1) : null,
+        per: s.per ? +s.per.toFixed(1) : null
       } : null
     };
   }
 
-  function scoreAsset(player) {
-    const contractPenalty = player.contract ? (player.contract.amount / 2000) * Math.max(1, player.contract.yrs || 1) : 0;
-    const youthBonus = Math.max(0, 25 - player.age) * 0.9;
-    const potentialBonus = Math.max(0, player.pot - player.ovr) * 0.7;
-    const productionBonus = player.stats?.per ? Math.max(0, player.stats.per - 12) * 0.9 : 0;
-    return Number((player.ovr * 1.5 + youthBonus + potentialBonus + productionBonus - contractPenalty).toFixed(1));
+  // rough trade value score - used to rank who other teams might move
+  function tradeValue(p) {
+    const contractPenalty = p.contract ? (p.contract.amount / 2000) * Math.max(1, p.contract.yrs) : 0;
+    const upside = Math.max(0, p.pot - p.ovr) * 0.7;
+    const youth  = Math.max(0, 25 - p.age) * 0.9;
+    const perf   = p.stats?.per ? Math.max(0, p.stats.per - 12) * 0.9 : 0;
+    return +(p.ovr * 1.5 + upside + youth + perf - contractPenalty).toFixed(1);
   }
 
-  function summarizeTeamWindow(teamPlayers) {
-    if (!teamPlayers.length) return 'unknown';
-    const avgAge = teamPlayers.reduce((s, p) => s + p.age, 0) / teamPlayers.length;
-    const avgOvrTop5 = teamPlayers.slice(0, 5).reduce((s, p) => s + p.ovr, 0) / Math.max(1, Math.min(5, teamPlayers.length));
-    if (avgOvrTop5 >= 63 && avgAge >= 27) return 'win-now';
-    if (avgAge <= 24.5) return 'youth';
-    return 'mixed';
-  }
+  // ── context builder ────────────────────────────────────
 
-  async function buildContext(leagueId) {
-    const db = await openDB(leagueId);
+  async function buildGameContext(id) {
+    const db = await openDB(id);
     const [attrs, players, teams, picks] = await Promise.all([
-      dbGetAll(db, 'gameAttributes'),
-      dbGetAll(db, 'players'),
-      dbGetAll(db, 'teams'),
-      dbGetAll(db, 'draftPicks')
+      getAll(db, 'gameAttributes'),
+      getAll(db, 'players'),
+      getAll(db, 'teams'),
+      getAll(db, 'draftPicks')
     ]);
 
+    // flatten gameAttributes array into a plain object
     const ga = Object.fromEntries(attrs.map(a => [a.key, a.value]));
-    const season = ga.season || new Date().getFullYear();
-    const userTid = Array.isArray(ga.userTid) ? ga.userTid[ga.userTid.length - 1].value : ga.userTid;
+    const season  = ga.season || new Date().getFullYear();
+    const userTid = Array.isArray(ga.userTid)
+      ? ga.userTid[ga.userTid.length - 1].value
+      : ga.userTid;
+
     const activeTeams = teams.filter(t => !t.disabled);
     const teamMap = new Map(activeTeams.map(t => [t.tid, t]));
-    const myTeam = teamMap.get(userTid);
+    const myTeam  = teamMap.get(userTid);
 
-    const allPlayers = players
+    // summarise all players (skip retired/historical)
+    const allSummarised = players
       .filter(p => p.tid !== -3 && p.tid !== -2)
-      .map(p => summarise(p, season))
+      .map(p => summarisePlayer(p, season))
       .filter(Boolean);
 
-    const playersByTid = new Map();
-    for (const p of allPlayers) {
-      if (!playersByTid.has(p.tid)) playersByTid.set(p.tid, []);
-      playersByTid.get(p.tid).push(p);
+    // group by team id for fast lookup
+    const byTeam = new Map();
+    for (const p of allSummarised) {
+      if (!byTeam.has(p.tid)) byTeam.set(p.tid, []);
+      byTeam.get(p.tid).push(p);
     }
-    for (const list of playersByTid.values()) list.sort((a, b) => b.ovr - a.ovr || b.pot - a.pot);
+    for (const list of byTeam.values()) list.sort((a, b) => b.ovr - a.ovr);
 
-    const roster = (playersByTid.get(userTid) || []).slice().sort((a, b) => b.ovr - a.ovr);
-    const fas = (playersByTid.get(-1) || []).slice().sort((a, b) => b.ovr - a.ovr).slice(0, 30);
-
-    const myPicks = picks.filter(p => p.tid === userTid).map(p => ({
-      season: p.season,
-      round: p.round,
-      isOwn: p.originalTid === userTid,
-      orig: p.originalTid === userTid ? (myTeam?.abbrev || 'OWN') : (teamMap.get(p.originalTid)?.abbrev || 'T' + p.originalTid)
-    })).sort((a, b) => a.season - b.season || a.round - b.round);
-
-    const teamSummaries = activeTeams.map(team => {
-      const teamPlayers = (playersByTid.get(team.tid) || []).slice().sort((a, b) => b.ovr - a.ovr);
-      const payroll = teamPlayers.reduce((s, p) => s + (p.contract?.amount || 0), 0);
-      const topPlayers = teamPlayers.slice(0, 6).map(p => ({
-        name: p.name,
-        pos: p.pos,
-        age: p.age,
-        ovr: p.ovr,
-        pot: p.pot,
-        contract: p.contract,
-        stats: p.stats,
-        assetScore: scoreAsset(p)
-      }));
-      const tradeTargets = teamPlayers
-        .filter(p => p.contract && p.ovr >= 45)
-        .map(p => ({ ...p, assetScore: scoreAsset(p) }))
-        .sort((a, b) => a.assetScore - b.assetScore)
-        .slice(0, 6);
-      return {
-        tid: team.tid,
-        abbrev: team.abbrev,
-        name: team.region + ' ' + team.name,
-        strategy: team.strategy || 'unknown',
-        payroll,
-        rosterCount: teamPlayers.length,
-        topPlayers,
-        tradeTargets,
-        teamWindow: summarizeTeamWindow(teamPlayers)
-      };
-    }).sort((a, b) => a.name.localeCompare(b.name));
-
+    const roster = byTeam.get(userTid) || [];
+    const freeAgents = (byTeam.get(-1) || []).slice(0, 30);
     const payroll = roster.reduce((s, p) => s + (p.contract?.amount || 0), 0);
 
+    const myPicks = picks
+      .filter(p => p.tid === userTid)
+      .map(p => ({
+        season: p.season,
+        round:  p.round,
+        isOwn:  p.originalTid === userTid,
+        orig:   p.originalTid === userTid
+          ? (myTeam?.abbrev || 'OWN')
+          : (teamMap.get(p.originalTid)?.abbrev || 'T' + p.originalTid)
+      }))
+      .sort((a, b) => a.season - b.season || a.round - b.round);
+
+    // build a snapshot of every other team (used for trade context)
+    const otherTeams = activeTeams
+      .filter(t => t.tid !== userTid)
+      .map(team => {
+        const tp = byTeam.get(team.tid) || [];
+        const tpay = tp.reduce((s, p) => s + (p.contract?.amount || 0), 0);
+        return {
+          tid:         team.tid,
+          abbrev:      team.abbrev,
+          name:        team.region + ' ' + team.name,
+          strategy:    team.strategy || 'unknown',
+          payroll:     tpay,
+          rosterCount: tp.length,
+          // top players and their trade value
+          top:    tp.slice(0, 5).map(p => ({ name: p.name, pos: p.pos, age: p.age, ovr: p.ovr, pot: p.pot, contract: p.contract })),
+          // players most likely to be moveable (low trade value = cheaper, possibly available)
+          moveable: tp
+            .filter(p => p.contract && p.ovr >= 45)
+            .map(p => ({ ...p, tv: tradeValue(p) }))
+            .sort((a, b) => a.tv - b.tv)
+            .slice(0, 4)
+            .map(p => ({ name: p.name, ovr: p.ovr, pot: p.pot, contract: p.contract }))
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+
     return {
-      season,
-      userTid,
-      teamName: myTeam ? myTeam.region + ' ' + myTeam.name : 'Unknown',
+      season, userTid,
+      teamName:   myTeam ? myTeam.region + ' ' + myTeam.name : 'Unknown',
       teamAbbrev: myTeam?.abbrev || '???',
-      strategy: myTeam?.strategy || 'unknown',
+      strategy:   myTeam?.strategy || 'unknown',
       cap: {
         salaryCap: ga.salaryCap,
-        luxury: ga.luxuryPayroll,
-        min: ga.minPayroll,
-        type: ga.salaryCapType,
+        luxury:    ga.luxuryPayroll,
+        min:       ga.minPayroll,
+        type:      ga.salaryCapType,
         payroll
       },
-      roster,
-      fas,
-      myPicks,
-      teamSummaries
+      roster, freeAgents, myPicks, otherTeams
     };
   }
 
-  function updateBar(gc, pageType) {
-    if (!gc) return;
-    subtitle.textContent = gc.teamName;
-    ctxTeam.textContent = gc.teamAbbrev;
-    ctxSeason.textContent = gc.season;
-    ctxPage.textContent = pageType;
-    if (gc.cap) {
-      ctxCap.textContent = '$' + Math.round(gc.cap.payroll / 1000) + 'M';
-      ctxCap.className = gc.cap.payroll > gc.cap.luxury ? 'bgm-strip-value danger' : 'bgm-strip-value';
-    }
+  // ── snapshot diffing ───────────────────────────────────
+  // detects changes between context refreshes so the AI knows what happened
+
+  function makeSnapshot(gc, pageType) {
+    return {
+      pageType,
+      rosterNames: gc.roster.map(p => p.name),
+      payroll:     gc.cap.payroll,
+      season:      gc.season
+    };
   }
+
+  function diffSnapshots(prev, next) {
+    if (!prev || !next) return [];
+    const changes = [];
+    const nextNames = new Set(next.rosterNames);
+    for (const n of next.rosterNames) {
+      if (!prev.rosterNames.includes(n)) changes.push('Added to roster: ' + n);
+    }
+    for (const n of prev.rosterNames) {
+      if (!nextNames.has(n)) changes.push('Removed from roster: ' + n);
+    }
+    if (Math.abs(next.payroll - prev.payroll) > 500) {
+      changes.push(`Payroll changed to $${Math.round(next.payroll / 1000)}M`);
+    }
+    return changes.slice(0, 6);
+  }
+
+  // ── context refresh ────────────────────────────────────
 
   async function refreshContext() {
-    const id = getLeagueId();
-    if (!id) return;
+    const m = location.pathname.match(/\/l\/(\d+)/);
+    if (!m) return;
+    const id = parseInt(m[1], 10);
+
     try {
-      const gc = await buildContext(id);
+      const gc       = await buildGameContext(id);
       const pageType = getPageType();
-      const page = getPageContent();
+      const page     = readPage();
+
       gameContext = { gc, pageType, page };
-      updateBar(gc, pageType);
-      const nextSnapshot = buildSnapshot(gc, pageType, page);
-      const diffs = diffSnapshots(previousSnapshot, nextSnapshot);
-      for (const diff of diffs) addLedgerEntry(diff);
-      previousSnapshot = nextSnapshot;
-      await saveSnapshot();
-      if (diffs.length) await saveActionLedger();
+      updateInfoStrip(gc, pageType);
+
+      // check if anything changed since last refresh
+      const snap = makeSnapshot(gc, pageType);
+      const diffs = diffSnapshots(lastSnapshot, snap);
+      for (const d of diffs) {
+        if (actionLog[actionLog.length - 1] !== d) actionLog.push(d);
+      }
+      lastSnapshot = snap;
+      if (diffs.length) await saveLog();
+      await saveSnap();
+
     } catch (e) {
-      console.warn('BGM Assistant context error:', e);
+      console.warn('BGM Assistant: context refresh failed', e);
     }
   }
 
-  function topRosterSlice(roster) {
-    const core = roster.slice(0, 10);
-    const badMoney = roster.filter(p => (p.contract?.amount || 0) >= 18000 && !core.find(c => c.pid === p.pid)).slice(0, 3);
-    const injured = roster.filter(p => p.injury && !core.find(c => c.pid === p.pid) && !badMoney.find(c => c.pid === p.pid)).slice(0, 2);
-    return [...core, ...badMoney, ...injured].slice(0, 14);
-  }
-
-  function inferPlanDirection(text) {
-    const t = (text || '').toLowerCase();
-    if (/rebuild|young|picks|tank|future/.test(t)) return 'rebuild';
-    if (/contend|win now|title|championship|playoff/.test(t)) return 'contend';
-    if (/dump salary|cap space|flexibility/.test(t)) return 'flex';
-    return 'balanced';
-  }
-
-  function shortlistLeagueTeams(gc) {
-    const direction = inferPlanDirection(userGoal);
-    const teams = gc.teamSummaries.filter(t => t.tid !== gc.userTid);
-    const scored = teams.map(team => {
-      let score = 0;
-      if (gameContext?.pageType?.includes('trade')) score += 8;
-      if (direction === 'rebuild' && (team.teamWindow === 'win-now' || team.strategy === 'contending')) score += 6;
-      if (direction === 'contend' && (team.teamWindow === 'youth' || team.strategy === 'rebuilding')) score += 6;
-      if (direction === 'flex' && team.payroll > gc.cap.salaryCap) score += 5;
-      score += Math.max(0, 16 - Math.abs(team.payroll - gc.cap.payroll) / 4000);
-      return { team, score };
-    }).sort((a, b) => b.score - a.score);
-    return scored.slice(0, 10).map(x => x.team);
-  }
-
-  function buildCacheFingerprint(question) {
-    const gc = gameContext?.gc;
-    if (!gc) return `nogame|${involvementLevel}|${learningMode}|${userGoal}|${question}`;
-    const rosterStamp = gc.roster.slice(0, 12).map(p => `${p.pid}:${p.ovr}:${p.pot}:${p.contract?.amount || 0}`).join(',');
-    const visibleStamp = extractLikelyPlayerNames(`${gameContext.page?.heading || ''}\n${gameContext.page?.tables || ''}`).slice(0, 20).join(',');
-    const pageStamp = `${gameContext.pageType}|${(gameContext.page?.heading || '').slice(0, 120)}|${(gameContext.page?.alerts || '').slice(0, 180)}|${visibleStamp}`;
-    return [gc.userTid, gc.season, involvementLevel, learningMode ? 1 : 0, userGoal || '-', pageStamp, rosterStamp, question.trim().toLowerCase()].join('|');
-  }
-
-  function canUseCache() {
-    const dynamicPages = new Set(['draft', 'free_agents', 'trade', 'trade_proposals']);
-    return !dynamicPages.has(gameContext?.pageType);
-  }
-  function buildRecentConversationBlock() {
-    const recent = chatHistory.slice(-8);
-    if (!recent.length) return '=== RECENT CHAT ===\n- none\n';
-    const lines = recent.map(m => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${m.content.replace(/\s+/g, ' ').trim().slice(0, 220)}`);
-    return `=== RECENT CHAT ===\n${lines.join('\n')}\n`;
-  }
-
-  function buildPlanStateBlock() {
-    const activePlan = userGoal ? userGoal : 'No active plan set.';
-    const rejected = rejectedPlanCandidates.length ? rejectedPlanCandidates.map(p => `- ${p}`).join('\n') : '- none';
-    return `=== ACTIVE PLAN ===\n${activePlan}\n\n=== PLAN GOVERNANCE ===\nRejected replacement plans (do not repeat these unless the user asks):\n${rejected}\n`;
-  }
-
-  function buildActionLedgerBlock() {
-    if (!actionLedger.length) return '=== RECENT STATE CHANGES ===\n- none tracked yet\n';
-    return `=== RECENT STATE CHANGES ===\n${actionLedger.slice(-10).map(x => `- ${x}`).join('\n')}\n`;
-  }
-
-  function buildPageRules(pageType) {
-    const common = ['Use fresh current-page availability over stale memory whenever they conflict.'];
-    if (pageType === 'draft') {
-      common.push('Draft advice must only use players still visible/available on the current page.');
-      common.push('If a player is no longer visible, do not recommend them.');
+  function updateInfoStrip(gc, pageType) {
+    subtitle.textContent  = gc.teamName;
+    ctxTeam.textContent   = gc.teamAbbrev;
+    ctxSeason.textContent = gc.season;
+    ctxPage.textContent   = pageType;
+    if (gc.cap) {
+      const pay = Math.round(gc.cap.payroll / 1000);
+      ctxCap.textContent = '$' + pay + 'M';
+      ctxCap.className = gc.cap.payroll > gc.cap.luxury
+        ? 'bgm-strip-value danger'
+        : 'bgm-strip-value';
     }
-    if (pageType === 'free_agents') common.push('Free agent advice must only use players still listed or in the provided free agent pool.');
-    if (pageType === 'trade' || pageType === 'trade_proposals') common.push('Trade advice must respect current roster counts and current page context.');
-    return `=== PAGE RULES ===\n${common.map(x => `- ${x}`).join('\n')}\n`;
   }
 
-  function buildLeagueContextBlock(gc) {
-    const lines = [];
-    for (const team of shortlistLeagueTeams(gc)) {
-      const top = team.topPlayers.slice(0, 3).map(p => `${p.name} (${p.ovr}/${p.pot}, ${p.age})`).join(', ');
-      const targets = team.tradeTargets.slice(0, 2).map(p => `${p.name} (${p.ovr}/${p.pot}, $${Math.round((p.contract?.amount || 0) / 1000)}M)`).join(', ');
-      lines.push(`${team.abbrev} | ${team.strategy} | ${team.teamWindow} | payroll $${Math.round(team.payroll / 1000)}M | roster ${team.rosterCount}/18 | top ${top || 'none'} | cheaper targets ${targets || 'none'}`);
+  // ── prompt builder ─────────────────────────────────────
+
+  // pick the most relevant other teams to include
+  // - if on a trade page: include all teams (user is actively trading)
+  // - otherwise: pick teams most likely to have useful trade partners
+  function pickRelevantTeams(gc, pageType) {
+    if (pageType === 'trade' || pageType === 'trade_proposals') {
+      return gc.otherTeams;
     }
-    return lines.join('\n');
+    const planLower = plan.toLowerCase();
+    const isRebuilding = /rebuild|tank|picks|young|future/.test(planLower);
+    return gc.otherTeams
+      .map(t => {
+        let score = 0;
+        // teams with opposite strategy are better trade partners
+        if (isRebuilding && t.strategy === 'contending') score += 4;
+        if (!isRebuilding && t.strategy === 'rebuilding') score += 4;
+        // teams with lots of roster space might want to take on salary
+        if (t.rosterCount < 12) score += 2;
+        return { t, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 12)
+      .map(x => x.t);
   }
 
-  function buildFullRosterNamesBlock(gc) {
-    if (!gc?.roster?.length) return '=== FULL ROSTER NAMES ===\n- none\n';
-    const names = gc.roster
-      .map(p => `${p.name} (${p.pos}, ${p.ovr}/${p.pot}, $${Math.round((p.contract?.amount || 0) / 1000)}M)`)
-      .join('\n');
-    return `=== FULL ROSTER NAMES (${gc.roster.length}/18) ===\n${names}\n`;
-  }
+  function buildPrompt(userText) {
+    const modeInfo = MODES[mode];
+    let p = SYSTEM_PROMPT + '\n\n';
 
-  function buildPrompt(lastUserText) {
-    const mode = MODES[involvementLevel];
-    let p = `${SYSTEM}\n\n`;
-    p += `CURRENT MODE: ${mode.label}\nMODE BEHAVIOR: ${mode.prompt}\nLEARNING MODE: ${learningMode ? 'ON' : 'OFF'}\n\n`;
-    p += buildPlanStateBlock() + '\n';
-    p += buildActionLedgerBlock() + '\n';
-    p += buildRecentConversationBlock() + '\n';
+    p += `MODE: ${modeInfo.label}\n${modeInfo.prompt}\n`;
+    p += `EXPLAIN REASONING: ${learningMode ? 'YES - add a short "Why this works" section at the end' : 'NO - skip it'}\n\n`;
+
+    // plan context
+    p += `ACTIVE PLAN: ${plan || 'Not set - ask the user what direction they want to go before making major recommendations.'}\n`;
+    if (rejectedPlans.length) {
+      p += `Plans user has rejected (don't suggest these again): ${rejectedPlans.join(' | ')}\n`;
+    }
+    p += '\n';
+
+    // recent game state changes we've detected
+    if (actionLog.length) {
+      p += `RECENT CHANGES DETECTED:\n${actionLog.slice(-8).map(x => '- ' + x).join('\n')}\n\n`;
+    }
+
+    // last few messages for short-term memory
+    if (chatHistory.length) {
+      const recent = chatHistory.slice(-6)
+        .map(m => `${m.role === 'user' ? 'User' : 'You'}: ${m.content.slice(0, 200)}`)
+        .join('\n');
+      p += `RECENT CONVERSATION:\n${recent}\n\n`;
+    }
 
     const gc = gameContext?.gc;
     if (!gc) {
-      p += 'No live data available. Be cautious and state limits clearly.\n';
+      p += 'NOTE: No live game data available. Answer carefully and note what data you\'re missing.\n';
+      p += `User asked: ${userText}\n`;
       return p;
     }
 
-    p += buildPageRules(gameContext.pageType) + '\n';
-    p += '=== GAME STATE ===\n';
-    p += `Team: ${gc.teamName} (${gc.teamAbbrev}) | Season: ${gc.season} | Strategy: ${gc.strategy}\n`;
-    p += `Page: ${gameContext.pageType}\n\n`;
+    // page-specific reminders
+    const pageType = gameContext.pageType;
+    if (pageType === 'draft') {
+      p += 'PAGE NOTE: Draft page. Only recommend players still visible/available on screen.\n\n';
+    } else if (pageType === 'free_agents') {
+      p += 'PAGE NOTE: Free agents page. Only recommend players in the provided FA pool.\n\n';
+    } else if (pageType === 'trade' || pageType === 'trade_proposals') {
+      p += 'PAGE NOTE: Trade page. Respect current roster counts. Check salary match and legality.\n\n';
+    }
 
     const c = gc.cap;
-    p += '=== CAP ===\n';
-    p += `Cap: $${Math.round(c.salaryCap / 1000)}M | Luxury: $${Math.round(c.luxury / 1000)}M | Min: $${Math.round(c.min / 1000)}M\n`;
-    p += `Payroll: $${Math.round(c.payroll / 1000)}M | Space under cap: $${Math.round(Math.max(0, c.salaryCap - c.payroll) / 1000)}M | Type: ${c.type}\n\n`;
+    p += `TEAM: ${gc.teamName} (${gc.teamAbbrev}) | Season: ${gc.season} | Strategy: ${gc.strategy}\n`;
+    p += `CAP: $${Math.round(c.salaryCap/1000)}M cap | $${Math.round(c.luxury/1000)}M luxury | $${Math.round(c.min/1000)}M min floor\n`;
+    p += `PAYROLL: $${Math.round(c.payroll/1000)}M | space: $${Math.round(Math.max(0, c.salaryCap - c.payroll)/1000)}M | type: ${c.type}\n\n`;
 
-    const rosterSlice = topRosterSlice(gc.roster);
-    p += `=== MY ROSTER (${gc.roster.length}/18 players, showing ${rosterSlice.length}) ===\n`;
-    for (const pl of rosterSlice) {
-      const ct = pl.contract ? `$${Math.round(pl.contract.amount / 1000)}M/${pl.contract.yrs}yr` : 'no contract';
-      const inj = pl.injury ? ` [${pl.injury}]` : '';
-      const st = pl.stats ? ` | ${pl.stats.pts ?? '-'} pts ${pl.stats.reb ?? '-'} reb ${pl.stats.ast ?? '-'} ast PER ${pl.stats.per ?? '-'}` : '';
+    // full roster - top 12 shown with full detail, rest just listed
+    const detailed = gc.roster.slice(0, 12);
+    const rest = gc.roster.slice(12);
+    p += `ROSTER (${gc.roster.length}/18 players):\n`;
+    for (const pl of detailed) {
+      const ct  = pl.contract ? `$${Math.round(pl.contract.amount/1000)}M/${pl.contract.yrs}yr` : 'no contract';
+      const inj = pl.injury ? ` [INJURED: ${pl.injury}]` : '';
+      const st  = pl.stats ? ` | ${pl.stats.pts ?? '-'} pts ${pl.stats.reb ?? '-'} reb ${pl.stats.ast ?? '-'} ast PER ${pl.stats.per ?? '-'}` : '';
       p += `${pl.name} | ${pl.pos} | Age ${pl.age} | OVR ${pl.ovr} POT ${pl.pot} | ${ct}${inj}${st}\n`;
     }
+    if (rest.length) {
+      p += `Also on roster: ${rest.map(pl => `${pl.name} (${pl.ovr}/${pl.pot}, $${Math.round((pl.contract?.amount||0)/1000)}M)`).join(', ')}\n`;
+    }
+    p += '\n';
 
-    p += '\n' + buildFullRosterNamesBlock(gc) + '\n';
-
-    p += '=== MY PICKS ===\n';
-    if (!gc.myPicks.length) {
-      p += 'No picks currently tracked.\n';
-    } else {
+    // draft picks
+    p += 'DRAFT PICKS OWNED:\n';
+    if (gc.myPicks.length) {
       const bySeason = {};
       for (const pk of gc.myPicks) (bySeason[pk.season] = bySeason[pk.season] || []).push(pk);
-      for (const [yr, seasonPicks] of Object.entries(bySeason)) {
-        const r1 = seasonPicks.filter(x => x.round === 1).map(x => x.isOwn ? 'OWN' : x.orig).join(', ');
-        const r2 = seasonPicks.filter(x => x.round === 2).map(x => x.isOwn ? 'OWN' : x.orig).join(', ');
-        p += `${yr}: ${(r1 ? `R1(${r1}) ` : '')}${(r2 ? `R2(${r2})` : '')}\n`;
+      for (const [yr, szn] of Object.entries(bySeason)) {
+        const r1 = szn.filter(x => x.round === 1).map(x => x.isOwn ? 'OWN' : x.orig).join(', ');
+        const r2 = szn.filter(x => x.round === 2).map(x => x.isOwn ? 'OWN' : x.orig).join(', ');
+        p += `${yr}: ${r1 ? `R1(${r1}) ` : ''}${r2 ? `R2(${r2})` : ''}\n`;
       }
+    } else {
+      p += 'No picks currently owned.\n';
     }
+    p += '\n';
 
-    p += '\n=== TOP FREE AGENTS ===\n';
-    for (const pl of gc.fas.slice(0, 10)) {
-      const ask = pl.contract ? `$${Math.round(pl.contract.amount / 1000)}M` : '?';
+    // top free agents
+    p += 'TOP FREE AGENTS:\n';
+    for (const pl of gc.freeAgents.slice(0, 15)) {
+      const ask = pl.contract ? `$${Math.round(pl.contract.amount/1000)}M` : '?';
       p += `${pl.name} | ${pl.pos} | Age ${pl.age} | OVR ${pl.ovr} POT ${pl.pot} | asking ${ask}\n`;
     }
+    p += '\n';
 
+    // current page content (tables, alerts etc)
     const pg = gameContext.page;
-    if (pg?.tables || pg?.alerts || pg?.heading) {
-      p += `\n=== CURRENT PAGE (${gameContext.pageType}) ===\n`;
+    if (pg?.heading || pg?.alerts || pg?.tables) {
+      p += `CURRENT PAGE (${pageType}):\n`;
       if (pg.heading) p += pg.heading + '\n';
       if (pg.alerts) p += 'Alerts: ' + pg.alerts + '\n';
-      if (pg.tables) p += pg.tables.slice(0, 2200) + (pg.tables.length > 2200 ? '\n[truncated]' : '') + '\n';
+      if (pg.tables) {
+        const trimmed = pg.tables.slice(0, 2500);
+        p += trimmed + (pg.tables.length > 2500 ? '\n[truncated]' : '') + '\n';
+      }
+      p += '\n';
     }
 
-    p += '\n=== LEAGUE SNAPSHOT ===\n';
-    p += buildLeagueContextBlock(gc) + '\n';
+    // other teams context - scoped to what's useful for current situation
+    const relevantTeams = pickRelevantTeams(gc, pageType);
+    p += 'OTHER TEAMS (most relevant to current situation):\n';
+    for (const t of relevantTeams) {
+      const topStr = t.top.slice(0, 3).map(x => `${x.name} (${x.ovr}/${x.pot}, ${x.age})`).join(', ');
+      const movStr = t.moveable.slice(0, 2).map(x => `${x.name} ($${Math.round((x.contract?.amount||0)/1000)}M)`).join(', ');
+      p += `${t.abbrev} | ${t.strategy} | payroll $${Math.round(t.payroll/1000)}M | roster ${t.rosterCount}/18 | top: ${topStr || 'none'} | possibly moveable: ${movStr || 'none'}\n`;
+    }
 
-    p += '\n=== RESPONSE PRIORITIES ===\n';
-    p += '- Respect the active plan first.\n';
-    p += '- Basketball GM roster limit is 18 players.\n';
-    p += '- If discussing trades, use payroll, roster count, team strategy, and player value together.\n';
-    p += '- If a specific legal conclusion cannot be confirmed, say legality uncertain.\n';
-    p += '- Avoid repeating the full context back to the user.\n';
-    p += '- If you propose a trade, prefer one clean framework with likely logic, not multiple lottery tickets.\n';
-    p += '- Think in layers: what to do now, what it sets up next, and what to monitor after that.\n';
-    p += '- Do not recommend exact minute totals or exact substitution timing.\n';
-    p += '- When learning mode is ON, explain the basketball principle briefly at the end.\n';
-    p += `- User just asked: ${lastUserText}\n`;
-
+    p += `\nUser's question: ${userText}\n`;
     return p;
   }
 
-  async function callOpenRouter(lastUserText) {
+  // ── caching ────────────────────────────────────────────
+
+  // build a fingerprint to check if we have a cached reply
+  // dynamic pages (trade, FA, draft) are never cached since the data changes fast
+  function cacheKey(text) {
+    const gc = gameContext?.gc;
+    if (!gc) return null;
+
+    const dynamicPages = new Set(['draft', 'free_agents', 'trade', 'trade_proposals']);
+    if (dynamicPages.has(gameContext?.pageType)) return null;
+
+    const rosterStamp = gc.roster.slice(0, 12)
+      .map(p => `${p.pid}:${p.ovr}:${p.contract?.amount || 0}`).join(',');
+    return [
+      gc.userTid, gc.season, mode, learningMode ? 1 : 0,
+      plan || '-',
+      gameContext.pageType,
+      rosterStamp,
+      text.trim().toLowerCase()
+    ].join('|');
+  }
+
+  // ── API call ───────────────────────────────────────────
+
+  async function callOpenRouter(userText) {
     if (!apiKey) throw new Error('No API key — click ⚙ to add your OpenRouter key.');
+
+    // system prompt + full history
     const messages = [
-      { role: 'system', content: buildPrompt(lastUserText) },
+      { role: 'system', content: buildPrompt(userText) },
       ...chatHistory.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }))
     ];
-    const body = {
-      model: DEFAULT_MODEL,
-      messages,
-      temperature: involvementLevel === 0 ? 0.25 : 0.4,
-      max_tokens: learningMode ? 850 : 575,
-      stream: false
-    };
+
     const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -995,81 +949,92 @@ OUTPUT RULES
         'HTTP-Referer': 'https://play.basketball-gm.com',
         'X-OpenRouter-Title': 'BGM Assistant'
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify({
+        model: MODEL,
+        messages,
+        temperature: mode === 0 ? 0.25 : 0.4,
+        max_tokens:  learningMode ? 900 : 600,
+        stream: false
+      })
     });
+
     if (!res.ok) {
-      const e = await res.json().catch(() => ({}));
-      throw new Error(e?.error?.message || 'API error ' + res.status);
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error?.message || 'OpenRouter error ' + res.status);
     }
+
     const data = await res.json();
     const text = data?.choices?.[0]?.message?.content;
     if (!text) throw new Error('Empty response from OpenRouter');
     return text;
   }
 
-  function parsePlanCandidate(text) {
-    const match = text.match(new RegExp(`${PLAN_MARKER}\\s*(.+)$`, 'm'));
-    return match ? match[1].trim() : '';
+  // ── plan candidate handling ────────────────────────────
+  // the AI can suggest a new plan by appending PLAN_UPDATE_CANDIDATE: ...
+
+  function extractPlanCandidate(text) {
+    const m = text.match(/PLAN_UPDATE_CANDIDATE:\s*(.+)$/m);
+    return m ? m[1].trim() : '';
   }
 
   function stripPlanMarker(text) {
-    return text.replace(new RegExp(`\\n?${PLAN_MARKER}\\s*.+$`, 'm'), '').trim();
+    return text.replace(/\n?PLAN_UPDATE_CANDIDATE:.+$/m, '').trim();
   }
 
-  function addPlanDecisionUI(candidate) {
+  function showPlanPrompt(candidate) {
     const wrap = document.createElement('div');
     wrap.className = 'bgm-message system';
-    const bubble = document.createElement('div');
-    bubble.className = 'bgm-bubble bgm-plan-prompt';
-    bubble.innerHTML = `${formatMessageHtml(`**Suggested plan change:** ${candidate}`)}<br><br>`;
+    const bub = document.createElement('div');
+    bub.className = 'bgm-bubble';
+    bub.innerHTML = format(`**Suggested plan:** ${candidate}`);
 
     const actions = document.createElement('div');
     actions.className = 'bgm-plan-actions';
 
-    const yesBtn = document.createElement('button');
-    yesBtn.className = 'bgm-mini-btn';
-    yesBtn.textContent = 'Use this plan';
-    yesBtn.addEventListener('click', async () => {
-      userGoal = candidate;
+    const yes = document.createElement('button');
+    yes.className = 'bgm-mini-btn';
+    yes.textContent = 'Use this plan';
+    yes.onclick = async () => {
+      plan = candidate;
       goalInput.value = candidate;
-      pendingPlanCandidate = '';
-      await saveGoal();
-      appendMsg('system', `Plan updated to: **${candidate}**`);
-    });
+      pendingPlan = '';
+      await savePlan();
+      addMsg('system', `Plan updated: ${candidate}`);
+    };
 
-    const noBtn = document.createElement('button');
-    noBtn.className = 'bgm-mini-btn secondary';
-    noBtn.textContent = 'Keep current plan';
-    noBtn.addEventListener('click', async () => {
-      pendingPlanCandidate = '';
-      rejectedPlanCandidates.push(candidate);
-      await saveRejectedPlans();
-      appendMsg('system', 'Kept the current plan. The assistant will follow it and stop pushing that replacement.');
-    });
+    const no = document.createElement('button');
+    no.className = 'bgm-mini-btn secondary';
+    no.textContent = 'Keep current plan';
+    no.onclick = async () => {
+      rejectedPlans.push(candidate);
+      pendingPlan = '';
+      await saveRejected();
+      addMsg('system', 'Kept current plan.');
+    };
 
-    actions.appendChild(yesBtn);
-    actions.appendChild(noBtn);
-    bubble.appendChild(actions);
-    wrap.appendChild(bubble);
+    actions.appendChild(yes);
+    actions.appendChild(no);
+    bub.appendChild(actions);
+    wrap.appendChild(bub);
     chatArea.appendChild(wrap);
     chatArea.scrollTop = chatArea.scrollHeight;
   }
 
-  function isYes(text) {
-    return /^(yes|yep|yeah|sure|do it|okay|ok)$/i.test(text.trim());
-  }
+  // quick yes/no detection for when user responds to a plan prompt via text
+  function isYes(text) { return /^(yes|yeah|yep|sure|ok|okay|do it)$/i.test(text.trim()); }
+  function isNo(text)  { return /^(no|nah|nope|keep|don'?t)$/i.test(text.trim()); }
 
-  function isNo(text) {
-    return /^(no|nah|nope|keep it|don'?t|do not)$/i.test(text.trim());
-  }
+  // ── send ───────────────────────────────────────────────
 
-  async function sendMessage() {
+  async function send() {
     const text = userInput.value.trim();
     if (!text) return;
 
+    // cooldown check
     const now = Date.now();
-    if (now - lastRequestAt < REQUEST_COOLDOWN_MS) {
-      appendMsg('system', `Give it a second — cooldown is ${Math.ceil((REQUEST_COOLDOWN_MS - (now - lastRequestAt)) / 1000)}s so you do not burn requests by accident.`);
+    if (now - lastCallAt < COOLDOWN) {
+      const wait = Math.ceil((COOLDOWN - (now - lastCallAt)) / 1000);
+      addMsg('system', `Hang on ${wait}s before sending another — avoids burning through your credits.`);
       return;
     }
 
@@ -1077,109 +1042,121 @@ OUTPUT RULES
     userInput.style.height = 'auto';
     sendBtn.disabled = true;
 
-    appendMsg('user', text);
+    addMsg('user', text);
     chatHistory.push({ role: 'user', content: text });
-    await saveChatHistory();
+    await saveChat();
 
-    if (pendingPlanCandidate && isYes(text)) {
-      userGoal = pendingPlanCandidate;
-      goalInput.value = pendingPlanCandidate;
-      const accepted = pendingPlanCandidate;
-      pendingPlanCandidate = '';
-      await saveGoal();
-      const reply = `Got it. **Active plan updated:** ${accepted}`;
-      await streamAssistantMessage(reply);
-      chatHistory.push({ role: 'assistant', content: reply });
-      await saveChatHistory();
-      sendBtn.disabled = false;
-      userInput.focus();
-      return;
-    }
-
-    if (pendingPlanCandidate && isNo(text)) {
-      rejectedPlanCandidates.push(pendingPlanCandidate);
-      await saveRejectedPlans();
-      pendingPlanCandidate = '';
-      const reply = 'Understood. I will follow the current plan and stop pushing that replacement unless you ask.';
-      await streamAssistantMessage(reply);
-      chatHistory.push({ role: 'assistant', content: reply });
-      await saveChatHistory();
-      sendBtn.disabled = false;
-      userInput.focus();
-      return;
+    // handle yes/no responses to a pending plan suggestion
+    if (pendingPlan) {
+      if (isYes(text)) {
+        plan = pendingPlan;
+        goalInput.value = plan;
+        const accepted = pendingPlan;
+        pendingPlan = '';
+        await savePlan();
+        await streamReply(`Got it. **Plan updated:** ${accepted}`);
+        chatHistory.push({ role: 'assistant', content: `Plan updated: ${accepted}` });
+        await saveChat();
+        sendBtn.disabled = false;
+        userInput.focus();
+        return;
+      }
+      if (isNo(text)) {
+        rejectedPlans.push(pendingPlan);
+        pendingPlan = '';
+        await saveRejected();
+        await streamReply('No problem, sticking with the current plan.');
+        chatHistory.push({ role: 'assistant', content: 'Sticking with current plan.' });
+        await saveChat();
+        sendBtn.disabled = false;
+        userInput.focus();
+        return;
+      }
     }
 
     showTyping();
-    let cached = null;
+
     try {
       await refreshContext();
-      const cacheKey = buildCacheFingerprint(text);
-      cached = canUseCache() ? responseCache[cacheKey] : null;
-      if (cached && (Date.now() - (cached.ts || 0) > CACHE_TTL_MS)) cached = null;
+
+      // check cache first
+      const ck = cacheKey(text);
       let rawReply;
-      if (cached) {
-        updateCacheStatus('Cached reply', 'ok');
+      const cached = ck ? responseCache[ck] : null;
+
+      if (cached && Date.now() - cached.ts < CACHE_TTL) {
         rawReply = cached.reply;
+        cacheLabel.textContent = 'Cached';
+        cacheLabel.className = 'ok';
       } else {
-        updateCacheStatus(canUseCache() ? 'Live call' : 'Live only', 'live');
-        lastRequestAt = Date.now();
+        cacheLabel.textContent = 'Live';
+        cacheLabel.className = 'live';
+        lastCallAt = Date.now();
         rawReply = await callOpenRouter(text);
-        if (canUseCache()) {
-          responseCache[cacheKey] = { reply: rawReply, ts: Date.now() };
-          await saveResponseCache();
+
+        if (ck) {
+          responseCache[ck] = { reply: rawReply, ts: Date.now() };
+          await saveCache();
         }
       }
+
       hideTyping();
-      const candidate = parsePlanCandidate(rawReply);
-      const reply = stripPlanMarker(rawReply);
-      if (candidate && !rejectedPlanCandidates.includes(candidate)) {
-        pendingPlanCandidate = candidate;
+
+      // check if the AI is suggesting a plan change
+      const candidate = extractPlanCandidate(rawReply);
+      const cleanReply = stripPlanMarker(rawReply);
+
+      if (candidate && !rejectedPlans.includes(candidate)) {
+        pendingPlan = candidate;
       } else {
-        pendingPlanCandidate = '';
+        pendingPlan = '';
       }
-      await streamAssistantMessage(reply);
-      chatHistory.push({ role: 'assistant', content: reply });
-      if (chatHistory.length > CHAT_LIMIT) chatHistory = chatHistory.slice(-CHAT_LIMIT);
-      await saveChatHistory();
-      if (pendingPlanCandidate) addPlanDecisionUI(pendingPlanCandidate);
-      if (!cached) updateCacheStatus('Fresh', 'ok');
+
+      await streamReply(cleanReply);
+      chatHistory.push({ role: 'assistant', content: cleanReply });
+      if (chatHistory.length > CHAT_KEEP) chatHistory = chatHistory.slice(-CHAT_KEEP);
+      await saveChat();
+
+      if (pendingPlan) showPlanPrompt(pendingPlan);
+      cacheLabel.textContent = 'Ready';
+      cacheLabel.className = '';
+
     } catch (e) {
       hideTyping();
       chatHistory.pop();
-      await saveChatHistory();
-      updateCacheStatus('Error', 'err');
+      await saveChat();
+      cacheLabel.textContent = 'Error';
+      cacheLabel.className = 'err';
+
       const wrap = document.createElement('div');
       wrap.className = 'bgm-message error';
-      const b = document.createElement('div');
-      b.className = 'bgm-bubble';
-      b.textContent = '✗ ' + e.message;
-      wrap.appendChild(b);
+      const bub = document.createElement('div');
+      bub.className = 'bgm-bubble';
+      bub.textContent = '✗ ' + e.message;
+      wrap.appendChild(bub);
       chatArea.appendChild(wrap);
       chatArea.scrollTop = chatArea.scrollHeight;
     }
+
     sendBtn.disabled = false;
     userInput.focus();
   }
 
-  try { refreshContext(); } catch (e) { console.error('BGM Assistant refreshContext failed on init', e); }
-  try { loadPersistentState(); } catch (e) { console.error('BGM Assistant loadPersistentState failed on init', e); }
+  // ── SPA navigation detection ───────────────────────────
+  // BGM is a React SPA so we watch for URL changes rather than page loads
 
   let lastUrl = location.href;
-  const observerTarget = document.body || document.documentElement;
-  if (observerTarget) {
-    new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        if (panelOpen) { try { refreshContext(); } catch (e) { console.error('BGM Assistant refreshContext failed on nav', e); } }
-        try { loadPersistentState(); } catch (e) { console.error('BGM Assistant loadPersistentState failed on nav', e); }
-      }
-    }).observe(observerTarget, { childList: true, subtree: true });
-  }
-  }
+  new MutationObserver(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      loadState();  // reload per-league state in case they switched leagues
+      if (panelOpen) refreshContext();
+    }
+  }).observe(document.body || document.documentElement, { childList: true, subtree: true });
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initAssistant, { once: true });
-  } else {
-    initAssistant();
-  }
+  // ── init ───────────────────────────────────────────────
+
+  loadState();
+  refreshContext();
+
 })();
