@@ -105,6 +105,20 @@ The current focus is improving:
 ## Model
 
 Recommended:
-
-```text
 deepseek/deepseek-chat-v3-0324
+
+---
+
+## Tech Stack
+
+- JavaScript (Firefox extension APIs)
+- IndexedDB (game state extraction)
+- OpenRouter API (LLM integration)
+- DeepSeek models
+- HTML/CSS (UI)
+
+---
+
+## Why this project?
+
+This project was built to explore how AI can be applied to real decision-making environments, rather than generic chat interfaces. The goal is to create an assistant that operates within the constraints of a system and provides grounded, actionable guidance.
