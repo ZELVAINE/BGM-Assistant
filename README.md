@@ -8,6 +8,11 @@ It’s designed to feel like a **co-GM sitting next to you**, not a generic chat
 
 ---
 
+## Status
+🟡 Mid-late stage development, testing and bug fixing.
+
+---
+
 ## Philosophy
 
 - **Grounded, not theoretical.** Advice is based on Basketball GM mechanics, not real NBA assumptions.
